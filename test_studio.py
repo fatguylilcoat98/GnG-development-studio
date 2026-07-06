@@ -1163,5 +1163,265 @@ class TestProjectFileEditor(Base):
             self.assertIsInstance(content, str)
 
 
+# ─── new-project creation ───────────────────────────────────────────────────────
+
+class TestCreateProject(Base):
+    def test_create_new_project_seeds_folder_and_fields(self):
+        p = s.create_project(self.projects, "My Test Thing", description="a test",
+                             kind="new", local_folder="~/my-test-thing")
+        self.assertEqual(p["id"], "my-test-thing")
+        self.assertEqual(p["kind"], "new")
+        self.assertEqual(p["repo_path"], "~/my-test-thing")
+        self.assertTrue(os.path.isdir(s.project_dir("my-test-thing")))
+        self.assertIn("my-test-thing", self.projects)
+
+    def test_slug_collisions_get_a_numeric_suffix(self):
+        p1 = s.create_project(self.projects, "Widget")
+        p2 = s.create_project(self.projects, "Widget")
+        self.assertEqual((p1["id"], p2["id"]), ("widget", "widget-2"))
+
+    def test_name_required_and_kind_validated(self):
+        with self.assertRaises(ValueError):
+            s.create_project(self.projects, "  ")
+        with self.assertRaises(ValueError):
+            s.create_project(self.projects, "x", kind="sideways")
+
+    def test_slugify_handles_punctuation(self):
+        self.assertEqual(s.slugify("Chris's Cool Project 2.0"), "chris-s-cool-project-2-0")
+        self.assertEqual(s.slugify("   "), "project")
+
+
+# ─── guided build orchestration ─────────────────────────────────────────────────
+
+class TestGuidedBuildNoCouncil(Base):
+    def test_full_flow_default_ai_team_no_council(self):
+        pid = "veracore"
+        self.assertEqual(s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms)["kind"],
+                         "not_started")
+
+        room = s.start_guided_build(pid, self.jobs, self.rooms, "Add a health check")
+        stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms)
+        self.assertEqual(stage["kind"], "chatgpt")
+        self.assertIn("Add a health check", stage["prompt"])
+
+        self.rooms.paste_chatgpt_response(room["id"], "Use a /health endpoint.")
+        stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms)
+        self.assertEqual(stage["kind"], "claude")
+
+        self.rooms.paste_claude_response(room["id"], "Agreed, return 200 with a JSON body.")
+        stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms)
+        self.assertEqual(stage["kind"], "plan_review")   # council off by default -> straight here
+        self.assertIn("Add a health check", stage["plan_draft"])
+
+        job, room, prompt = s.guided_approve_plan(self.projects, self.rooms, self.notes, pid,
+                                                  room["id"], stage["plan_draft"])
+        self.assertEqual(room["status"], "Ready for Claude Code")
+        self.assertIn("Use Claude Code.", prompt)
+        stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms)
+        self.assertEqual(stage["kind"], "send_build_prompt")
+
+        s.guided_sent_to_claude_code(self.jobs, stage["job_id"])
+        stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms)
+        self.assertEqual(stage["kind"], "claude_code_report")
+
+        s.guided_claude_code_report(self.jobs, self.reports, stage["job_id"], pid,
+                                    TestClaudeReportIngestion.GOOD_REPORT)
+        stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms)
+        self.assertEqual(stage["kind"], "test_review")
+
+        s.guided_continue_after_test(self.jobs, stage["job_id"])
+        stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms)
+        # GOOD_REPORT sets NEEDS APPROVAL: no -> Testing goes straight to Completed
+        self.assertEqual(stage["kind"], "complete")
+        self.assertFalse(stage["needs_final_click"])
+
+    def test_ai_team_skip_chatgpt_and_claude(self):
+        pid = "veracore"
+        s.start_guided_build(pid, self.jobs, self.rooms, "idea",
+                             ai_team={"chatgpt": False, "claude": False})
+        stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms)
+        self.assertEqual(stage["kind"], "plan_review")   # both skipped -> straight to plan
+
+    def test_claude_code_is_always_mandatory_regardless_of_ai_team(self):
+        room = self.rooms.create("veracore", "idea", ai_team={"claude_code": False})
+        self.assertTrue(room["ai_team"]["claude_code"])
+
+
+class TestGuidedBuildConstraintsThreading(Base):
+    def test_wizard_constraints_and_safety_notes_reach_the_final_job(self):
+        pid = "veracore"
+        room = s.start_guided_build(pid, self.jobs, self.rooms, "Add a widget",
+                                    constraints="Only touch the widgets/ folder.",
+                                    safety_notes="Never touch the payments table.")
+        self.rooms.paste_chatgpt_response(room["id"], "x")
+        self.rooms.paste_claude_response(room["id"], "y")
+        stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms)
+        job, room, prompt = s.guided_approve_plan(self.projects, self.rooms, self.notes, pid,
+                                                  room["id"], stage["plan_draft"])
+        self.assertIn("Only touch the widgets/ folder.", job["constraints"])
+        self.assertEqual(job["safety_notes"], "Never touch the payments table.")
+        self.assertIn("Never touch the payments table.", prompt)
+
+
+class TestGuidedBuildWithCouncil(Base):
+    def test_council_choice_appears_when_enabled(self):
+        pid = "veracore"
+        room = s.start_guided_build(pid, self.jobs, self.rooms, "idea", ai_team={"council": True})
+        self.rooms.paste_chatgpt_response(room["id"], "x")
+        self.rooms.paste_claude_response(room["id"], "y")
+        stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms)
+        self.assertEqual(stage["kind"], "council_choice")
+
+    def test_skip_council_from_choice_goes_to_plan_review(self):
+        pid = "veracore"
+        room = s.start_guided_build(pid, self.jobs, self.rooms, "idea", ai_team={"council": True})
+        self.rooms.paste_chatgpt_response(room["id"], "x")
+        self.rooms.paste_claude_response(room["id"], "y")
+        s.guided_generate_plan(self.rooms, room["id"])
+        stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms)
+        self.assertEqual(stage["kind"], "plan_review")
+
+    def test_running_council_then_done_reaches_plan_review_with_council_text(self):
+        pid = "veracore"
+        room = s.start_guided_build(pid, self.jobs, self.rooms, "idea", ai_team={"council": True})
+        self.rooms.paste_chatgpt_response(room["id"], "x")
+        self.rooms.paste_claude_response(room["id"], "y")
+        stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms)
+        self.assertEqual(stage["kind"], "council_choice")
+        self.rooms.paste_council_response(room["id"], "Grok", "council insight z")
+        stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms)
+        self.assertEqual(stage["kind"], "council")
+        s.guided_generate_plan(self.rooms, room["id"])
+        stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms)
+        self.assertEqual(stage["kind"], "plan_review")
+        self.assertIn("council insight z", stage["plan_draft"])
+
+    def test_approve_plan_uses_edited_text_even_when_already_at_unified_plan_ready(self):
+        pid = "veracore"
+        room = s.start_guided_build(pid, self.jobs, self.rooms, "idea", ai_team={"council": False})
+        self.rooms.paste_chatgpt_response(room["id"], "x")
+        self.rooms.paste_claude_response(room["id"], "y")
+        stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms)
+        s.guided_generate_plan(self.rooms, room["id"])   # -> Unified Plan Ready
+        job, room2, prompt = s.guided_approve_plan(self.projects, self.rooms, self.notes, pid,
+                                                    room["id"], "Chris's hand-edited final plan")
+        self.assertEqual(room2["unified_plan"], "Chris's hand-edited final plan")
+        self.assertIn("Chris's hand-edited final plan", job["description"])
+
+
+class TestGuidedBuildApprovalGate(Base):
+    def test_needs_approval_path_and_reject_then_reapprove(self):
+        pid = "veracore"
+        room = s.start_guided_build(pid, self.jobs, self.rooms, "idea")
+        self.rooms.paste_chatgpt_response(room["id"], "x")
+        self.rooms.paste_claude_response(room["id"], "y")
+        stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms)
+        job, room, _ = s.guided_approve_plan(self.projects, self.rooms, self.notes, pid,
+                                             room["id"], stage["plan_draft"])
+        s.guided_sent_to_claude_code(self.jobs, job["id"])
+        report = ("STATUS: Blocked\nFILES CHANGED: x\nTESTS: 2/5\nCOMMIT: none\nPR: none\n"
+                 "BLOCKERS: needs a decision\nNEXT ACTION: fix\nNEEDS APPROVAL: yes")
+        s.guided_claude_code_report(self.jobs, self.reports, job["id"], pid, report)
+        s.guided_continue_after_test(self.jobs, job["id"])
+        stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms)
+        self.assertEqual(stage["kind"], "needs_approval")
+
+        self.jobs.reject(job["id"], "needs another pass")
+        stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms)
+        self.assertEqual(stage["kind"], "claude_code_report")   # back to Building -> report stage
+
+        s.guided_claude_code_report(self.jobs, self.reports, job["id"], pid,
+                                    TestClaudeReportIngestion.GOOD_REPORT)
+        s.guided_continue_after_test(self.jobs, job["id"])
+        stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms)
+        self.assertEqual(stage["kind"], "complete")   # GOOD_REPORT needs_approval: no
+
+    def test_guided_complete_walks_approved_to_completed_to_archived(self):
+        job = self.make_job(project="veracore", approval_required=True)
+        for st in ["Planning", "Ready for ChatGPT", "ChatGPT Planned", "Ready for Claude",
+                  "Sent to Claude", "Building", "Testing", "Needs Chris Approval", "Approved"]:
+            job = self.jobs.advance(job["id"], st)
+        job = s.guided_complete(self.jobs, job["id"])
+        self.assertEqual(job["status"], "Completed")
+        job = s.guided_complete(self.jobs, job["id"])
+        self.assertEqual(job["status"], "Archived")
+        job2 = s.guided_complete(self.jobs, job["id"])
+        self.assertEqual(job2["status"], "Archived")   # no-op once archived
+
+
+class TestGuidedBuildHTTP(Base):
+    def setUp(self):
+        super().setUp()
+        s.build_app_state()
+        s.Handler.projects = self.projects
+        s.Handler.jobs = self.jobs
+        s.Handler.reports = self.reports
+        s.Handler.decisions = self.decisions
+        s.Handler.risks = self.risks
+        s.Handler.notes = self.notes
+        s.Handler.rooms = self.rooms
+        self.server = s.ThreadingHTTPServer(("127.0.0.1", 0), s.Handler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        super().tearDown()
+
+    def _req(self, path, payload=None):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        req = (urllib.request.Request(url) if payload is None else
+              urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                     headers={"Content-Type": "application/json"}))
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode() or "{}")
+
+    def test_create_project_endpoint(self):
+        code, p = self._req("/api/projects", {"name": "New Thing", "kind": "new"})
+        self.assertEqual((code, p["id"]), (201, "new-thing"))
+
+    def test_guided_flow_end_to_end_over_http(self):
+        code, stage = self._req("/api/guided/veracore/stage")
+        self.assertEqual((code, stage["kind"]), (200, "not_started"))
+
+        code, stage = self._req("/api/guided/veracore/start", {"idea": "Add a widget"})
+        self.assertEqual((code, stage["kind"]), (201, "chatgpt"))
+
+        code, stage = self._req("/api/guided/veracore/chatgpt-response", {"text": "x"})
+        self.assertEqual(stage["kind"], "claude")
+
+        code, stage = self._req("/api/guided/veracore/claude-response", {"text": "y"})
+        self.assertEqual(stage["kind"], "plan_review")
+
+        code, stage = self._req("/api/guided/veracore/approve-plan",
+                                {"plan_text": stage["plan_draft"]})
+        self.assertEqual(stage["kind"], "send_build_prompt")
+
+        code, stage = self._req("/api/guided/veracore/sent-to-claude-code", {})
+        self.assertEqual(stage["kind"], "claude_code_report")
+
+        code, stage = self._req("/api/guided/veracore/claude-code-report",
+                                {"raw": TestClaudeReportIngestion.GOOD_REPORT})
+        self.assertEqual(stage["kind"], "test_review")
+
+        code, stage = self._req("/api/guided/veracore/continue-after-test", {})
+        self.assertEqual(stage["kind"], "complete")
+
+    def test_guided_actions_before_start_are_404(self):
+        code, err = self._req("/api/guided/veracore/chatgpt-response", {"text": "x"})
+        self.assertEqual(code, 404)
+
+    def test_root_serves_guided_and_advanced_serves_dashboard(self):
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/", timeout=5) as r:
+            self.assertEqual(r.status, 200)
+            self.assertIn(b"<html", r.read()[:200].lower())
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/advanced", timeout=5) as r:
+            self.assertEqual(r.status, 200)
+            self.assertIn(b"<html", r.read()[:200].lower())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

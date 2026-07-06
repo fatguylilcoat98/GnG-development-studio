@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GNG Development Studio</title>
+<style>
+  :root{--bg:#0b1020;--panel:#121a30;--line:#22304f;--txt:#dbe4f5;--dim:#8ea0c0;
+        --ok:#3ecf8e;--bad:#ff6b6b;--warn:#ffc857;--accent:#5aa7ff}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font:15px/1.6 system-ui,-apple-system,Segoe UI,sans-serif;min-height:100vh}
+  header{display:flex;align-items:center;gap:14px;padding:16px 24px;border-bottom:1px solid var(--line)}
+  h1{font-size:19px;margin:0}
+  .tag{color:var(--dim);font-size:12.5px;flex:1}
+  a.advanced{color:var(--dim);font-size:12.5px;text-decoration:none;border:1px solid var(--line);
+       border-radius:7px;padding:5px 11px}
+  a.advanced:hover{color:var(--accent);border-color:var(--accent)}
+  main{max-width:760px;margin:0 auto;padding:32px 20px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:28px}
+  h2{font-size:15px;margin:0 0 18px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em}
+  h3{font-size:13px;margin:0 0 4px;color:var(--dim)}
+  p.lead{color:var(--dim);margin-top:0}
+  label{display:block;font-size:13px;color:var(--dim);margin:14px 0 6px}
+  input,textarea,select{background:#0d1426;border:1px solid var(--line);color:var(--txt);
+       border-radius:8px;padding:10px 12px;font:inherit;font-size:14.5px;width:100%}
+  textarea{min-height:80px;resize:vertical}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:18px}
+  .check{display:flex;align-items:center;gap:8px;color:var(--txt);font-size:14px;margin:8px 0}
+  .check input{width:auto}
+  button{background:var(--accent);color:#08111f;border:0;border-radius:9px;
+         padding:11px 20px;font-weight:700;cursor:pointer;font-size:14.5px}
+  button:disabled{opacity:.35;cursor:not-allowed}
+  button.ghost{background:transparent;color:var(--accent);border:1px solid var(--line)}
+  button.danger{background:var(--bad)}
+  button.big{width:100%;padding:14px;font-size:16px}
+  .steps{display:flex;gap:6px;margin-bottom:22px}
+  .steps i{flex:1;height:4px;border-radius:2px;background:#1a2440}
+  .steps i.on{background:var(--accent)}
+  .intervention{border:2px solid var(--warn);border-radius:12px;padding:20px;background:#221a08}
+  .intervention h2{color:var(--warn)}
+  .intervention .what{font-weight:700;font-size:16px;margin-bottom:6px}
+  pre.copyblock{background:#0d1426;border:1px solid var(--line);border-radius:8px;padding:14px;
+       white-space:pre-wrap;font-size:13px;max-height:320px;overflow:auto;margin:10px 0}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:14px;margin:10px 0}
+  .kv b{color:var(--dim);font-weight:600;font-size:12.5px}
+  .ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)} .dim{color:var(--dim)}
+  .council-entry{border:1px solid var(--line);border-radius:8px;padding:10px;margin:8px 0;background:#0d1426;font-size:13px}
+  .hidden{display:none}
+</style>
+</head>
+<body>
+<header>
+  <h1>GNG Development Studio</h1>
+  <span class="tag">guided build</span>
+  <a class="advanced" href="/advanced">Advanced view →</a>
+</header>
+<main>
+
+  <!-- HOME: project picker -->
+  <section id="view-home" class="card">
+    <h2>Projects</h2>
+    <p class="lead">Pick what to do next.</p>
+    <select id="home-select">
+      <option value="">Choose…</option>
+      <option value="__start_new__">＋ Start New Project</option>
+      <option value="__continue__">▶ Continue Project (resume where I left off)</option>
+    </select>
+    <div id="home-projects"></div>
+  </section>
+
+  <!-- WIZARD: 4-step new project setup -->
+  <section id="view-wizard" class="card hidden">
+    <div class="steps" id="wizard-steps"></div>
+
+    <div id="wiz-step-1">
+      <h2>Step 1 — Project Setup</h2>
+      <label>Name</label><input id="w-name" placeholder="e.g. GNG Status Page">
+      <label>Description</label><textarea id="w-description" placeholder="What is this project?"></textarea>
+      <label>New or existing codebase?</label>
+      <div class="row">
+        <label class="check"><input type="radio" name="w-kind" value="new" checked> New</label>
+        <label class="check"><input type="radio" name="w-kind" value="existing"> Existing</label>
+      </div>
+      <label>Local folder</label><input id="w-folder" placeholder="~/my-project">
+      <label>Repo URL</label><input id="w-repo" placeholder="https://github.com/…">
+      <div class="row"><button onclick="wizNext(1)">Next</button></div>
+    </div>
+
+    <div id="wiz-step-2" class="hidden">
+      <h2>Step 2 — Build Setup</h2>
+      <label>What are we building?</label><textarea id="w-what"></textarea>
+      <label>Success criteria</label><textarea id="w-success"></textarea>
+      <label>Constraints</label><textarea id="w-constraints"></textarea>
+      <label>Safety notes</label><textarea id="w-safety"></textarea>
+      <div class="row">
+        <button class="ghost" onclick="wizBack(2)">Back</button>
+        <button onclick="wizNext(2)">Next</button>
+      </div>
+    </div>
+
+    <div id="wiz-step-3" class="hidden">
+      <h2>Step 3 — AI Team</h2>
+      <label class="check"><input type="checkbox" id="w-chatgpt" checked> ChatGPT (planning direction)</label>
+      <label class="check"><input type="checkbox" id="w-claude" checked> Claude (independent critique)</label>
+      <label class="check"><input type="checkbox" checked disabled> Claude Code (execution — always on)</label>
+      <label class="check"><input type="checkbox" id="w-council"> Council (optional multi-AI round)</label>
+      <div class="row">
+        <button class="ghost" onclick="wizBack(3)">Back</button>
+        <button onclick="wizNext(3)">Next</button>
+      </div>
+    </div>
+
+    <div id="wiz-step-4" class="hidden">
+      <h2>Step 4 — Review</h2>
+      <div class="kv" id="wiz-summary"></div>
+      <div class="row">
+        <button class="ghost" onclick="wizBack(4)">Back</button>
+        <button class="big" onclick="startBuild()">Start Build</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- BUILD: one auto-advancing screen -->
+  <section id="view-build" class="card hidden">
+    <div class="row" style="margin-top:0;margin-bottom:14px">
+      <button class="ghost" onclick="goHome()">← Projects</button>
+      <span class="dim" id="build-project-name" style="flex:1;text-align:right"></span>
+    </div>
+    <div id="stage-body">Loading…</div>
+  </section>
+
+</main>
+<script>
+const $=id=>document.getElementById(id);
+let projects={}, curProject=null, wizStep=1;
+
+async function j(url,opts){const r=await fetch(url,opts);return r.json();}
+async function post(url,body){return j(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});}
+function esc(s){const d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML;}
+async function copyText(text){
+  try{await navigator.clipboard.writeText(text);}
+  catch(e){const ta=document.createElement('textarea');ta.value=text;document.body.appendChild(ta);
+    ta.select();document.execCommand('copy');ta.remove();}
+}
+function show(id){['view-home','view-wizard','view-build'].forEach(v=>$(v).classList.toggle('hidden',v!==id));}
+
+async function loadProjects(){
+  const m=await j('/api/projects');
+  projects=Object.fromEntries(m.projects.map(p=>[p.id,p]));
+  const sel=$('home-select');
+  [...sel.querySelectorAll('option[data-project]')].forEach(o=>o.remove());
+  Object.values(projects).forEach(p=>{
+    const o=document.createElement('option');
+    o.value=p.id;o.dataset.project='1';
+    o.textContent=p.name+(p.hands_off?' (hands-off)':'');
+    sel.appendChild(o);
+  });
+}
+
+$('home-select').addEventListener('change', async ()=>{
+  const v=$('home-select').value;
+  $('home-select').value='';
+  if(v==='__start_new__'){openWizard();return;}
+  if(v==='__continue__'){
+    const fr=await j('/api/founder-report');
+    if(fr.active_project){await openBuild(fr.active_project.id);}
+    else alert('No active project yet — pick one from the list, or Start New Project.');
+    return;
+  }
+  if(v)await openBuild(v);
+});
+
+function goHome(){show('view-home');curProject=null;loadProjects();}
+
+/* ── wizard ── */
+function openWizard(){
+  wizStep=1;
+  ['w-name','w-description','w-folder','w-repo','w-what','w-success','w-constraints','w-safety']
+    .forEach(id=>$(id).value='');
+  $('w-chatgpt').checked=true;$('w-claude').checked=true;$('w-council').checked=false;
+  document.querySelector('input[name="w-kind"][value="new"]').checked=true;
+  renderWizStep();
+  show('view-wizard');
+}
+function renderWizStep(){
+  for(let i=1;i<=4;i++)$(`wiz-step-${i}`).classList.toggle('hidden',i!==wizStep);
+  $('wizard-steps').innerHTML=[1,2,3,4].map(i=>`<i class="${i<=wizStep?'on':''}"></i>`).join('');
+  if(wizStep===4)renderWizSummary();
+}
+function wizNext(from){
+  if(from===1&&!$('w-name').value.trim()){alert('Give the project a name.');return;}
+  if(from===2&&!$('w-what').value.trim()){alert('Describe what you\'re building.');return;}
+  wizStep=from+1;renderWizStep();
+}
+function wizBack(from){wizStep=from-1;renderWizStep();}
+function renderWizSummary(){
+  const kind=document.querySelector('input[name="w-kind"]:checked').value;
+  const team=[$('w-chatgpt').checked&&'ChatGPT',$('w-claude').checked&&'Claude','Claude Code',
+    $('w-council').checked&&'Council'].filter(Boolean).join(', ');
+  $('wiz-summary').innerHTML=`
+    <b>Name</b><span>${esc($('w-name').value)}</span>
+    <b>Kind</b><span>${esc(kind)}</span>
+    <b>Folder</b><span>${esc($('w-folder').value)||'(not set)'}</span>
+    <b>Repo</b><span>${esc($('w-repo').value)||'(not set)'}</span>
+    <b>Building</b><span>${esc($('w-what').value)}</span>
+    <b>Success criteria</b><span>${esc($('w-success').value)||'(not set)'}</span>
+    <b>Constraints</b><span>${esc($('w-constraints').value)||'(none)'}</span>
+    <b>Safety notes</b><span>${esc($('w-safety').value)||'(none)'}</span>
+    <b>AI team</b><span>${team}</span>`;
+}
+async function startBuild(){
+  const kind=document.querySelector('input[name="w-kind"]:checked').value;
+  const proj=await post('/api/projects',{name:$('w-name').value,description:$('w-description').value,
+    kind,local_folder:$('w-folder').value,repo_url:$('w-repo').value});
+  if(proj.error){alert(proj.error);return;}
+  let idea=$('w-what').value;
+  if($('w-success').value.trim())idea+=`\n\nSuccess criteria: ${$('w-success').value}`;
+  const ai_team={chatgpt:$('w-chatgpt').checked,claude:$('w-claude').checked,
+    claude_code:true,council:$('w-council').checked};
+  const r=await post(`/api/guided/${proj.id}/start`,{idea,ai_team,
+    constraints:$('w-constraints').value,safety_notes:$('w-safety').value});
+  if(r.error){alert(r.error);return;}
+  curProject=proj.id;
+  await post(`/api/project/${proj.id}/active`,{});
+  $('build-project-name').textContent=proj.name;
+  show('view-build');
+  renderStage(r);
+}
+
+/* ── build view ── */
+async function openBuild(pid){
+  curProject=pid;
+  await post(`/api/project/${pid}/active`,{});
+  $('build-project-name').textContent=projects[pid]?.name||pid;
+  show('view-build');
+  const stage=await j(`/api/guided/${pid}/stage`);
+  renderStage(stage);
+}
+async function refreshStage(){
+  const stage=await j(`/api/guided/${curProject}/stage`);
+  renderStage(stage);
+}
+
+function interventionShell(what, needed, actionHtml){
+  return `<div class="intervention">
+    <h2>Human Intervention Required</h2>
+    <div class="what">${esc(what)}</div>
+    <p class="lead">${needed}</p>
+    ${actionHtml}
+  </div>`;
+}
+function copyButton(elId){
+  return `<button class="ghost" onclick="copyText($('${elId}').textContent)">Copy</button>`;
+}
+
+async function renderStage(stage){
+  const body=$('stage-body');
+  if(stage.kind==='not_started'){
+    body.innerHTML=`
+      <h2>Start a build for this project</h2>
+      <label>What are we building?</label><textarea id="ns-what"></textarea>
+      <label>Constraints</label><textarea id="ns-constraints"></textarea>
+      <label>Safety notes</label><textarea id="ns-safety"></textarea>
+      <label class="check"><input type="checkbox" id="ns-chatgpt" checked> ChatGPT</label>
+      <label class="check"><input type="checkbox" id="ns-claude" checked> Claude</label>
+      <label class="check"><input type="checkbox" id="ns-council"> Council (optional)</label>
+      <div class="row"><button class="big" onclick="nsStart()">Start Build</button></div>`;
+    return;
+  }
+  if(stage.kind==='chatgpt'){
+    body.innerHTML=interventionShell('Send this to ChatGPT.',
+      'Copy the prompt below, run it in ChatGPT, paste the response back, then continue.',
+      `<pre class="copyblock" id="stage-prompt">${esc(stage.prompt)}</pre>
+       ${copyButton('stage-prompt')}
+       <label>ChatGPT's response</label><textarea id="stage-paste"></textarea>
+       <div class="row"><button class="big" onclick="submitStage('chatgpt-response',{text:$('stage-paste').value})">Continue</button></div>`);
+    return;
+  }
+  if(stage.kind==='claude'){
+    body.innerHTML=interventionShell('Send this to Claude.',
+      'Copy the prompt below, run it in Claude, paste the response back, then continue.',
+      `<pre class="copyblock" id="stage-prompt">${esc(stage.prompt)}</pre>
+       ${copyButton('stage-prompt')}
+       <label>Claude's response</label><textarea id="stage-paste"></textarea>
+       <div class="row"><button class="big" onclick="submitStage('claude-response',{text:$('stage-paste').value})">Continue</button></div>`);
+    return;
+  }
+  if(stage.kind==='council_choice'){
+    body.innerHTML=`
+      <h2>Optional council round</h2>
+      <p class="lead">Run a multi-AI council, or skip straight to the plan.</p>
+      <div class="row">
+        <button onclick="showCouncilPaste()">Run Council</button>
+        <button class="ghost" onclick="submitStage('skip-council',{})">Skip Council</button>
+      </div>
+      <div id="council-paste-area"></div>`;
+    return;
+  }
+  if(stage.kind==='council'){
+    const list=(stage.responses_so_far||[]).map(c=>
+      `<div class="council-entry"><b>${esc(c.author)}</b>: ${esc(c.content)}</div>`).join('')
+      ||'<div class="dim">No council responses pasted yet.</div>';
+    body.innerHTML=`
+      <h2>Council round</h2>
+      <pre class="copyblock" id="stage-prompt">${esc(stage.prompt)}</pre>
+      ${copyButton('stage-prompt')}
+      <label>Who / which model?</label><input id="council-author">
+      <label>Response</label><textarea id="council-text"></textarea>
+      <div class="row">
+        <button class="ghost" onclick="addCouncilResponse()">Add Response</button>
+        <button onclick="submitStage('council-done',{})">Done — Review Plan</button>
+      </div>
+      <h3 style="margin-top:16px">Responses so far</h3>${list}`;
+    return;
+  }
+  if(stage.kind==='plan_review'){
+    body.innerHTML=`
+      <h2>Review the unified plan</h2>
+      <p class="lead">Auto-drafted from what's been gathered so far — edit anything before approving.</p>
+      <textarea id="plan-text" style="min-height:220px">${esc(stage.plan_draft)}</textarea>
+      <div class="row"><button class="big" onclick="approvePlan()">Approve &amp; Generate Build Prompt</button></div>`;
+    return;
+  }
+  if(stage.kind==='send_build_prompt'){
+    body.innerHTML=interventionShell('Send this to Claude Code.',
+      'Copy the build prompt below and run it in Claude Code. Once you\'ve sent it, continue.',
+      `<pre class="copyblock" id="stage-prompt">${esc(stage.prompt)}</pre>
+       ${copyButton('stage-prompt')}
+       <div class="row"><button class="big" onclick="submitStage('sent-to-claude-code',{})">I sent it — Continue</button></div>`);
+    return;
+  }
+  if(stage.kind==='claude_code_report'){
+    body.innerHTML=interventionShell('Waiting on Claude Code.',
+      'Once Claude Code finishes, paste its final report below.',
+      `<label>Claude Code's report</label><textarea id="stage-paste" style="min-height:160px"></textarea>
+       <div class="row"><button class="big" onclick="submitStage('claude-code-report',{raw:$('stage-paste').value})">Save Report &amp; Continue</button></div>`);
+    return;
+  }
+  if(stage.kind==='test_review'){
+    body.innerHTML=`
+      <h2>Test review</h2>
+      ${reportSummary(stage.latest_report)}
+      <div class="row"><button class="big" onclick="submitStage('continue-after-test',{})">Continue</button></div>`;
+    return;
+  }
+  if(stage.kind==='needs_approval'){
+    body.innerHTML=`
+      <h2>Needs your approval</h2>
+      ${reportSummary(stage.latest_report)}
+      <div class="row">
+        <button onclick="submitStage('approve',{})">Approve</button>
+        <button class="ghost" onclick="rejectBuild()">Send Back for More Work</button>
+      </div>`;
+    return;
+  }
+  if(stage.kind==='complete'){
+    const label=stage.archived?'Archived.':(stage.needs_final_click?'Approved — one more step.':'Completed.');
+    body.innerHTML=`
+      <h2>${stage.archived?'Done':'Build Complete'}</h2>
+      <p class="lead">${label}</p>
+      ${stage.archived?'':`<div class="row"><button class="big" onclick="submitStage('complete',{})">${stage.needs_final_click?'Mark Complete':'Archive'}</button></div>`}`;
+    return;
+  }
+  if(stage.kind==='stalled'){
+    body.innerHTML=`<h2 class="bad">Needs manual attention</h2>
+      <p class="lead">${esc(stage.reason)}</p>
+      <a class="advanced" href="/advanced">Open the advanced dashboard →</a>`;
+    return;
+  }
+  body.innerHTML=`<div class="dim">Unknown stage: ${esc(stage.kind)}</div>`;
+}
+
+function reportSummary(report){
+  if(!report)return '<p class="dim">(no report on file)</p>';
+  return `<div class="kv">
+    <b>Status</b><span>${esc(report.status||'unparsed')}</span>
+    <b>Tests</b><span>${esc(report.tests||'—')}</span>
+    <b>Commit</b><span>${esc(report.commit||'—')}</span>
+    <b>Blockers</b><span>${esc(report.blockers||'—')}</span>
+    <b>Next action</b><span>${esc(report.next_action||'—')}</span>
+  </div>
+  <pre class="copyblock">${esc(report.raw||'')}</pre>`;
+}
+
+async function submitStage(action,body){
+  const r=await post(`/api/guided/${curProject}/${action}`,body);
+  if(r.error){alert(r.error);return;}
+  renderStage(r);
+}
+function showCouncilPaste(){
+  $('council-paste-area').innerHTML=`
+    <label>Who / which model?</label><input id="council-author">
+    <label>Response</label><textarea id="council-text"></textarea>
+    <div class="row"><button onclick="addCouncilResponse()">Add Response</button></div>`;
+}
+async function addCouncilResponse(){
+  const author=$('council-author').value,text=$('council-text').value;
+  if(!text.trim())return;
+  await submitStage('council-response',{author,text});
+}
+async function approvePlan(){
+  await submitStage('approve-plan',{plan_text:$('plan-text').value});
+}
+async function rejectBuild(){
+  const reason=prompt('Reason for sending this back:')||'';
+  await submitStage('reject',{reason});
+}
+async function nsStart(){
+  if(!$('ns-what').value.trim()){alert('Describe what you\'re building.');return;}
+  const ai_team={chatgpt:$('ns-chatgpt').checked,claude:$('ns-claude').checked,
+    claude_code:true,council:$('ns-council').checked};
+  const r=await post(`/api/guided/${curProject}/start`,{idea:$('ns-what').value,ai_team,
+    constraints:$('ns-constraints').value,safety_notes:$('ns-safety').value});
+  if(r.error){alert(r.error);return;}
+  renderStage(r);
+}
+
+(async()=>{ await loadProjects(); show('view-home'); })();
+</script>
+</body>
+</html>

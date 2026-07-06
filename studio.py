@@ -33,6 +33,7 @@ STATE_DIR = os.path.join(ROOT, "state")
 REPORTS_DIR = os.path.join(ROOT, "reports")
 PROJECTS_DIR = os.path.join(ROOT, "projects")
 DASHBOARD_PATH = os.path.join(ROOT, "dashboard.html")
+GUIDED_PATH = os.path.join(ROOT, "guided.html")
 
 PROJECTS_PATH = os.path.join(STATE_DIR, "projects.json")
 JOBS_PATH = os.path.join(STATE_DIR, "jobs.jsonl")
@@ -72,6 +73,8 @@ PROJECT_STATE_HEADINGS = [
     "Latest Council Notes", "Active PRs", "Risks", "Needs Chris",
     "Next Action", "Last Updated",
 ]
+
+DEFAULT_AI_TEAM = {"chatgpt": True, "claude": True, "claude_code": True, "council": False}
 
 STUDIO_WHO_IS_CHRIS = (
     "Chris is the founder/operator directing every GNG project. He works "
@@ -260,6 +263,43 @@ def update_project(projects, pid, **fields):
     p.update(fields)
     save_projects(projects)
     return p
+
+
+def slugify(name):
+    slug = re.sub(r"[^a-z0-9]+", "-", str(name).strip().lower()).strip("-")
+    return slug or "project"
+
+
+def create_project(projects, name, description="", kind="existing", local_folder="",
+                   repo_url="", ptype="tool"):
+    """The 11 seeded projects are a starting registry, not a ceiling — this is
+    how 'Start New Project' adds one. Slugs auto-dedupe (project, project-2, ...)
+    rather than colliding with an existing id."""
+    name = str(name).strip()
+    if not name:
+        raise ValueError("project name is required")
+    if kind not in ("new", "existing"):
+        raise ValueError("kind must be 'new' or 'existing'")
+    if ptype not in PROJECT_TYPES:
+        raise ValueError(f"type must be one of {PROJECT_TYPES}")
+    base = slugify(name)
+    pid, n = base, 2
+    while pid in projects:
+        pid, n = f"{base}-{n}", n + 1
+    project = {
+        "id": pid, "name": name, "type": ptype,
+        "repo_path": str(local_folder or "").strip(),
+        "github_url": str(repo_url or "").strip(),
+        "live_service_name": None, "port": None,
+        "status": "new project" if kind == "new" else "existing project",
+        "kind": kind, "hands_off": False, "notes": str(description or "").strip(),
+        "current_goal": "", "current_branch": None, "latest_commit": None,
+        "open_pr": None, "next_action": "",
+    }
+    projects[pid] = project
+    save_projects(projects)
+    ensure_project_folder(pid, project)
+    return project
 
 
 # ── studio state (active project) ──────────────────────────────────────────────
@@ -473,6 +513,10 @@ class JobStore:
             "latest_report_id": None, "created_at": time.time(), "updated_at": time.time(),
         }
         return self._save(rec)
+
+    def set_approval_required(self, jid, value):
+        job = dict(self._get(jid), approval_required=bool(value))
+        return self._save(job)
 
     @staticmethod
     def allowed_next(job):
@@ -828,15 +872,19 @@ class PlanningRoomStore:
             vals = [r for r in vals if r.get("project") == project]
         return sorted(vals, key=lambda r: r["created_at"], reverse=True)
 
-    def create(self, project, chris_idea):
+    def create(self, project, chris_idea, ai_team=None, constraints="", safety_notes=""):
         _require_known_project(self.projects, project)
         chris_idea = str(chris_idea).strip()
         if not chris_idea:
             raise ValueError("Chris's original idea is required")
+        team = dict(DEFAULT_AI_TEAM)
+        team.update(ai_team or {})
+        team["claude_code"] = True   # mandatory — there is no build without it
         rec = {
             "id": _id(), "project": project, "status": "Idea", "chris_idea": chris_idea,
             "chatgpt_response": "", "claude_response": "", "council_responses": [],
-            "disagreements": "", "risks": "", "unified_plan": "",
+            "disagreements": "", "risks": "", "unified_plan": "", "ai_team": team,
+            "constraints": str(constraints).strip(), "safety_notes": str(safety_notes).strip(),
             "chris_signoff": None, "emergency_skip": None, "linked_job_id": None,
             "history": [{"status": "Idea", "at": _now()}],
             "created_at": time.time(), "updated_at": time.time(),
@@ -966,10 +1014,12 @@ class PlanningRoomStore:
         if room["linked_job_id"] is None:
             title = room["chris_idea"][:80]
             description = room["unified_plan"] or room["chris_idea"]
-            constraints = "\n".join(x for x in (room.get("disagreements", ""),
+            constraints = "\n".join(x for x in (room.get("constraints", ""),
+                                                room.get("disagreements", ""),
                                                 room.get("risks", "")) if x)
             job = self.jobs.create(project=room["project"], title=title,
-                                   description=description, constraints=constraints)
+                                   description=description, constraints=constraints,
+                                   safety_notes=room.get("safety_notes", ""))
             room = dict(room, linked_job_id=job["id"])
             room = self._save(room)
         if room["status"] != "Ready for Claude Code":
@@ -1035,6 +1085,171 @@ QUESTIONS TO ANSWER
 {q_block}
 
 Do not agree blindly. Challenge assumptions."""
+
+
+# ── guided build: a thin, stateless orchestration layer over the Planning ─────
+# Room + Job machinery. It invents NO new persisted state machine — every
+# transition below is the same rule already enforced by PlanningRoomStore /
+# JobStore; this layer only decides WHICH screen to show and sequences a few
+# calls behind one button, so the guided UI never needs more than one primary
+# action. Advanced users can still drive rooms/jobs directly (dashboard.html
+# at /advanced); guided.html and this layer are one more front door, not a
+# replacement plumbing system.
+GUIDED_STAGES = ("not_started", "chatgpt", "claude", "council_choice", "council",
+                 "plan_review", "send_build_prompt", "claude_code_report",
+                 "test_review", "needs_approval", "complete", "stalled")
+
+
+def draft_unified_plan(room):
+    """A plain, no-AI-call merge of everything gathered so far — Chris reviews
+    and edits it before anything is committed. Not clever synthesis, just a
+    legible starting point so the guided flow never stalls waiting on typing."""
+    parts = [f"IDEA: {room['chris_idea']}"]
+    if room.get("chatgpt_response"):
+        parts.append(f"\nCHATGPT DIRECTION:\n{room['chatgpt_response']}")
+    if room.get("claude_response"):
+        parts.append(f"\nCLAUDE CRITIQUE:\n{room['claude_response']}")
+    for c in room.get("council_responses", []):
+        parts.append(f"\nCOUNCIL ({c.get('author', '?')}):\n{c.get('content', '')}")
+    if room.get("disagreements"):
+        parts.append(f"\nDISAGREEMENTS TO RESOLVE:\n{room['disagreements']}")
+    parts.append("\n(Auto-drafted from the above — edit before approving if needed.)")
+    return "\n".join(parts)
+
+
+def compute_guided_stage(pid, projects, jobs, rooms, reports=None):
+    project = get_project(projects, pid)
+    proj_rooms = rooms.list(project=pid)
+    room = proj_rooms[0] if proj_rooms else None
+    if room is None:
+        return {"kind": "not_started", "project": pid}
+    job = None
+    if room.get("linked_job_id"):
+        try:
+            job = jobs.get(room["linked_job_id"])
+        except NotFound:
+            job = None
+    if job is not None:
+        return _guided_stage_from_job(job, room, project, reports)
+    return _guided_stage_from_room(room, project, rooms)
+
+
+def _guided_stage_from_room(room, project, rooms):
+    team = room.get("ai_team") or DEFAULT_AI_TEAM
+    status = room["status"]
+    base = {"room_id": room["id"], "project": room["project"]}
+    if status == "Idea":
+        return dict(base, kind="chatgpt", idea=room["chris_idea"],
+                   prompt=rooms.build_chatgpt_prompt(room["id"], project))
+    if status == "ChatGPT Reviewed":
+        return dict(base, kind="claude", prompt=rooms.build_claude_prompt(room["id"], project))
+    if status == "Claude Reviewed":
+        if team.get("council"):
+            return dict(base, kind="council_choice")
+        return dict(base, kind="plan_review", plan_draft=draft_unified_plan(room))
+    if status == "Council Needed":
+        return dict(base, kind="council", prompt=rooms.build_council_prompt(room["id"], project),
+                   responses_so_far=room["council_responses"])
+    if status in ("Council Complete", "Unified Plan Ready"):
+        return dict(base, kind="plan_review",
+                   plan_draft=room["unified_plan"] or draft_unified_plan(room))
+    if status == "Chris Signed Off":
+        return dict(base, kind="plan_review", plan_draft=room["unified_plan"], ready_to_build=True)
+    return dict(base, kind="stalled", reason=f"Planning room stuck at unhandled status: {status}")
+
+
+def _guided_stage_from_job(job, room, project, reports):
+    base = {"job_id": job["id"], "room_id": room["id"], "project": job["project"]}
+    status = job["status"]
+    if status in ("Draft", "Planning", "Ready for ChatGPT", "ChatGPT Planned", "Ready for Claude"):
+        return dict(base, kind="send_build_prompt",
+                   prompt=build_claude_code_build_prompt(job, project))
+    if status in ("Sent to Claude", "Building"):
+        return dict(base, kind="claude_code_report")
+    if status in ("Testing", "Needs Chris Approval"):
+        latest = None
+        if reports is not None:
+            recs = reports.list(job_id=job["id"])
+            latest = recs[0] if recs else None
+        return dict(base, kind=("test_review" if status == "Testing" else "needs_approval"),
+                   latest_report=latest)
+    if status == "Approved":
+        return dict(base, kind="complete", needs_final_click=True, archived=False)
+    if status in ("Completed", "Archived"):
+        return dict(base, kind="complete", needs_final_click=False, archived=status == "Archived")
+    return dict(base, kind="stalled", reason=f"Job stuck at unhandled status: {status}")
+
+
+def start_guided_build(pid, jobs, rooms, idea, ai_team=None, constraints="", safety_notes=""):
+    """Entry point for 'Start Build'. Auto-skips any AI-team member Chris
+    turned off in the wizard by recording a placeholder response for it, so
+    the state machine advances exactly as if it had been reviewed."""
+    room = rooms.create(project=pid, chris_idea=idea, ai_team=ai_team,
+                        constraints=constraints, safety_notes=safety_notes)
+    team = room["ai_team"]
+    if not team.get("chatgpt"):
+        room = rooms.paste_chatgpt_response(room["id"],
+                                            "(skipped — ChatGPT not part of this build's AI team)")
+    if not team.get("claude"):
+        room = rooms.paste_claude_response(room["id"],
+                                           "(skipped — Claude not part of this build's AI team)")
+    return room
+
+
+def guided_generate_plan(rooms, room_id):
+    """Used by both 'Skip council' (from Claude Reviewed) and 'Done pasting'
+    (from Council Needed) — auto-drafts and saves the plan, landing on
+    Unified Plan Ready either way."""
+    room = rooms.get(room_id)
+    return rooms.generate_unified_plan_draft(room_id, draft_unified_plan(room))
+
+
+def guided_approve_plan(projects, rooms, notes, pid, room_id, plan_text):
+    """The one 'commit' button: save Chris's (possibly edited) plan text,
+    sign off, generate the Claude Code build prompt, and save it as a note —
+    idempotent-safe to call whether or not generate_unified_plan_draft already
+    ran (updating unified_plan text never requires a status to already match)."""
+    room = rooms.generate_unified_plan_draft(room_id, plan_text)
+    if room["status"] == "Unified Plan Ready":
+        room = rooms.chris_approved(room_id, note="approved via guided build")
+    job, room = rooms.generate_claude_code_build_prompt(room_id, pid)
+    project = get_project(projects, pid)
+    prompt = build_claude_code_build_prompt(job, project)
+    notes.create(project=pid, job_id=job["id"], note_type="claude_code_prompt", content=prompt)
+    return job, room, prompt
+
+
+def guided_sent_to_claude_code(jobs, job_id):
+    """Chris clicked 'Sent it' — walk the job through its purely-linear
+    pre-build stages straight to Building (all single-legal-step, no gate)."""
+    return _auto_walk_forward(jobs, job_id, "Building")
+
+
+def guided_claude_code_report(jobs, reports, job_id, project_id, raw):
+    job = jobs.get(job_id)
+    rec = reports.ingest(job_id, project_id, raw)
+    if rec.get("needs_approval") is not None:
+        job = jobs.set_approval_required(job_id, rec["needs_approval"])
+    if job["status"] == "Building":
+        job = jobs.advance(job_id, "Testing")
+    return job, rec
+
+
+def guided_continue_after_test(jobs, job_id):
+    job = jobs.get(job_id)
+    nxt = JobStore.allowed_next(job)
+    if not nxt:
+        raise IllegalTransition(f"job {job_id} has no legal next step from {job['status']}")
+    return jobs.advance(job_id, nxt[0])   # single legal option at Testing — no branching to pick
+
+
+def guided_complete(jobs, job_id):
+    job = jobs.get(job_id)
+    if job["status"] == "Approved":
+        return jobs.advance(job_id, "Completed")
+    if job["status"] == "Completed":
+        return jobs.advance(job_id, "Archived")
+    return job
 
 
 # ── cross-cutting: needs-chris, project memory, where-are-we, continuity ───────
@@ -1618,6 +1833,12 @@ class Handler(BaseHTTPRequestHandler):
         sync_project_state(pid, self.projects, self.jobs, self.reports,
                            self.decisions, self.risks, self.rooms)
 
+    def _guided_room(self, pid):
+        rooms = self.rooms.list(project=pid)
+        if not rooms:
+            raise NotFound(f"no guided build has been started for project: {pid}")
+        return rooms[0]
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path, qs = parsed.path, {k: v[0] for k, v in parse_qs(parsed.query).items()}
@@ -1687,6 +1908,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, results)
             if path == "/api/inbox":
                 return self._send(200, {"items": build_ai_inbox(self.projects, self.jobs, self.rooms)})
+            m = re.match(rf"^/api/guided/({_PID_RE})/stage$", path)
+            if m:
+                stage = compute_guided_stage(m.group(1), self.projects, self.jobs, self.rooms,
+                                             self.reports)
+                return self._send(200, stage)
             m = re.match(rf"^/api/project/({_PID_RE})/timeline$", path)
             if m:
                 get_project(self.projects, m.group(1))
@@ -1733,7 +1959,13 @@ class Handler(BaseHTTPRequestHandler):
                 room = self.rooms.get(m.group(1))
                 project = get_project(self.projects, room["project"])
                 return self._send(200, {"prompt": self.rooms.build_council_prompt(m.group(1), project)})
-            if path in ("/", "/index.html"):
+            if path in ("/", "/index.html", "/guided", "/guided.html"):
+                try:
+                    with open(GUIDED_PATH, "rb") as f:
+                        return self._send(200, f.read(), "text/html; charset=utf-8")
+                except OSError:
+                    return self._send(404, {"error": "guided.html missing"})
+            if path in ("/advanced", "/advanced.html", "/dashboard", "/dashboard.html"):
                 try:
                     with open(DASHBOARD_PATH, "rb") as f:
                         return self._send(200, f.read(), "text/html; charset=utf-8")
@@ -1749,6 +1981,15 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         try:
+            if path == "/api/projects":
+                b = self._body()
+                project = create_project(self.projects, name=b.get("name", ""),
+                                         description=b.get("description", ""),
+                                         kind=b.get("kind", "existing"),
+                                         local_folder=b.get("local_folder", ""),
+                                         repo_url=b.get("repo_url", ""),
+                                         ptype=b.get("type", "tool"))
+                return self._send(201, project)
             if path == "/api/jobs":
                 b = self._body()
                 job = self.jobs.create(project=b.get("project", ""), title=b.get("title", ""),
@@ -1937,6 +2178,118 @@ class Handler(BaseHTTPRequestHandler):
                 self._sync(room["project"])
                 return self._send(200, {"job": self._with_next(job),
                                         "room": self._room_with_next(room), "prompt": prompt})
+
+            # ── guided build: thin routes over the same room/job primitives ──
+            m = re.match(rf"^/api/guided/({_PID_RE})/start$", path)
+            if m:
+                pid = m.group(1)
+                b = self._body()
+                room = start_guided_build(pid, self.jobs, self.rooms, b.get("idea", ""),
+                                          ai_team=b.get("ai_team"),
+                                          constraints=b.get("constraints", ""),
+                                          safety_notes=b.get("safety_notes", ""))
+                self._sync(pid)
+                return self._send(201, compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports))
+            m = re.match(rf"^/api/guided/({_PID_RE})/chatgpt-response$", path)
+            if m:
+                pid = m.group(1)
+                room = self._guided_room(pid)
+                self.rooms.paste_chatgpt_response(room["id"], self._body().get("text", ""))
+                self._sync(pid)
+                return self._send(200, compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports))
+            m = re.match(rf"^/api/guided/({_PID_RE})/claude-response$", path)
+            if m:
+                pid = m.group(1)
+                room = self._guided_room(pid)
+                self.rooms.paste_claude_response(room["id"], self._body().get("text", ""))
+                self._sync(pid)
+                return self._send(200, compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports))
+            m = re.match(rf"^/api/guided/({_PID_RE})/council-response$", path)
+            if m:
+                pid = m.group(1)
+                room = self._guided_room(pid)
+                b = self._body()
+                self.rooms.paste_council_response(room["id"], b.get("author", ""), b.get("text", ""))
+                self._sync(pid)
+                return self._send(200, compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports))
+            m = re.match(rf"^/api/guided/({_PID_RE})/skip-council$", path)
+            if m:
+                pid = m.group(1)
+                room = self._guided_room(pid)
+                guided_generate_plan(self.rooms, room["id"])
+                self._sync(pid)
+                return self._send(200, compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports))
+            m = re.match(rf"^/api/guided/({_PID_RE})/council-done$", path)
+            if m:
+                pid = m.group(1)
+                room = self._guided_room(pid)
+                guided_generate_plan(self.rooms, room["id"])
+                self._sync(pid)
+                return self._send(200, compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports))
+            m = re.match(rf"^/api/guided/({_PID_RE})/approve-plan$", path)
+            if m:
+                pid = m.group(1)
+                room = self._guided_room(pid)
+                plan_text = self._body().get("plan_text", "")
+                guided_approve_plan(self.projects, self.rooms, self.notes, pid, room["id"], plan_text)
+                self._sync(pid)
+                return self._send(200, compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports))
+            m = re.match(rf"^/api/guided/({_PID_RE})/sent-to-claude-code$", path)
+            if m:
+                pid = m.group(1)
+                stage = compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports)
+                if not stage.get("job_id"):
+                    return self._send(409, {"error": "no build prompt has been generated yet"})
+                guided_sent_to_claude_code(self.jobs, stage["job_id"])
+                self._sync(pid)
+                return self._send(200, compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports))
+            m = re.match(rf"^/api/guided/({_PID_RE})/claude-code-report$", path)
+            if m:
+                pid = m.group(1)
+                stage = compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports)
+                if not stage.get("job_id"):
+                    return self._send(409, {"error": "no job is waiting on a report"})
+                guided_claude_code_report(self.jobs, self.reports, stage["job_id"], pid,
+                                          self._body().get("raw", ""))
+                self._sync(pid)
+                return self._send(200, compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports))
+            m = re.match(rf"^/api/guided/({_PID_RE})/continue-after-test$", path)
+            if m:
+                pid = m.group(1)
+                stage = compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports)
+                if not stage.get("job_id"):
+                    return self._send(409, {"error": "no job is at Testing"})
+                guided_continue_after_test(self.jobs, stage["job_id"])
+                self._sync(pid)
+                return self._send(200, compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports))
+            m = re.match(rf"^/api/guided/({_PID_RE})/approve$", path)
+            if m:
+                pid = m.group(1)
+                stage = compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports)
+                if not stage.get("job_id"):
+                    return self._send(409, {"error": "no job is waiting on approval"})
+                self.jobs.advance(stage["job_id"], "Approved")
+                self._sync(pid)
+                return self._send(200, compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports))
+            m = re.match(rf"^/api/guided/({_PID_RE})/reject$", path)
+            if m:
+                pid = m.group(1)
+                stage = compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports)
+                if not stage.get("job_id"):
+                    return self._send(409, {"error": "no job is waiting on approval"})
+                self.jobs.reject(stage["job_id"], self._body().get("reason", ""))
+                self._sync(pid)
+                return self._send(200, compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports))
+            m = re.match(rf"^/api/guided/({_PID_RE})/complete$", path)
+            if m:
+                pid = m.group(1)
+                stage = compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports)
+                if not stage.get("job_id"):
+                    return self._send(409, {"error": "no job to complete"})
+                guided_complete(self.jobs, stage["job_id"])
+                self._sync(pid)
+                return self._send(200, compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports))
+
             return self._send(404, {"error": "not found"})
         except NotFound as e:
             return self._send(404, {"error": str(e)})
