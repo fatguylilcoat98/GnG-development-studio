@@ -35,6 +35,9 @@
   button.ghost{background:transparent;color:var(--accent);border:1px solid var(--line)}
   button.danger{background:var(--bad)}
   button.big{width:100%;padding:14px;font-size:16px}
+  a.open-btn{display:inline-block;background:var(--ok);color:#08111f;border-radius:9px;
+       padding:11px 18px;font-weight:700;text-decoration:none;font-size:14.5px;min-height:44px;
+       line-height:22px}
   .steps{display:flex;gap:6px;margin-bottom:22px}
   .steps i{flex:1;height:4px;border-radius:2px;background:#1a2440}
   .steps i.on{background:var(--accent)}
@@ -47,6 +50,7 @@
   .kv{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:14px;margin:10px 0}
   .kv b{color:var(--dim);font-weight:600;font-size:12.5px}
   .kv span{word-break:break-word;overflow-wrap:anywhere}
+  .kv code{background:#0d1426;border:1px solid var(--line);border-radius:6px;padding:2px 6px;font-size:13px}
   .ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)} .dim{color:var(--dim)}
   .council-entry{border:1px solid var(--line);border-radius:8px;padding:10px;margin:8px 0;background:#0d1426;font-size:13px;word-break:break-word}
   .hidden{display:none}
@@ -59,7 +63,7 @@
     h1{font-size:17px}
     .tag{flex:1 1 100%;order:3;font-size:12px}
     .row{flex-direction:column;align-items:stretch}
-    .row button{width:100%}
+    .row button, .row a.open-btn{width:100%;text-align:center}
     .kv{grid-template-columns:1fr}
     .kv b{margin-top:8px}
     .kv b:first-child{margin-top:0}
@@ -71,6 +75,7 @@
 <header>
   <h1>GNG Development Studio</h1>
   <span class="tag">guided build</span>
+  <a class="advanced" href="/outcomes">Built Projects →</a>
   <a class="advanced" href="/advanced">Advanced view →</a>
 </header>
 <main>
@@ -358,6 +363,7 @@ async function renderStage(stage){
   if(stage.kind==='test_review'){
     body.innerHTML=`
       <h2>Test review</h2>
+      ${outcomeCard(stage.outcome)}
       ${reportSummary(stage.latest_report)}
       <div class="row"><button class="big" onclick="submitStage('continue-after-test',{})">Continue</button></div>`;
     return;
@@ -365,6 +371,7 @@ async function renderStage(stage){
   if(stage.kind==='needs_approval'){
     body.innerHTML=`
       <h2>Needs your approval</h2>
+      ${outcomeCard(stage.outcome)}
       ${reportSummary(stage.latest_report)}
       <div class="row">
         <button onclick="submitStage('approve',{})">Approve</button>
@@ -377,6 +384,7 @@ async function renderStage(stage){
     body.innerHTML=`
       <h2>${stage.archived?'Done':'Build Complete'}</h2>
       <p class="lead">${label}</p>
+      ${outcomeCard(stage.outcome)}
       ${stage.archived?'':`<div class="row"><button class="big" onclick="submitStage('complete',{})">${stage.needs_final_click?'Mark Complete':'Archive'}</button></div>`}`;
     return;
   }
@@ -387,6 +395,43 @@ async function renderStage(stage){
     return;
   }
   body.innerHTML=`<div class="dim">Unknown stage: ${esc(stage.kind)}</div>`;
+}
+
+function outcomeCard(o){
+  if(!o)return '';
+  const openBtn=o.test_url
+    ? `<a class="open-btn" href="${esc(o.test_url)}" target="_blank" rel="noopener">Open →</a>`
+    : '';
+  return `<div class="kv" style="margin-top:0">
+      <b>Project</b><span>${esc(o.project_name)}</span>
+      <b>Status</b><span>${esc(o.status||'unknown')}</span>
+      <b>Folder</b><span><code>${esc(o.folder||'(not recorded)')}</code></span>
+      <b>Test command</b><span><code>${esc(o.test_command||'(not recorded)')}</code></span>
+      <b>Test URL</b><span>${o.test_url?`<code>${esc(o.test_url)}</code>`:'(not recorded)'}</span>
+      <b>Files created / changed</b><span>${esc(o.files_changed||'—')}</span>
+      <b>Notes / blockers</b><span>${esc(o.notes||'—')}</span>
+    </div>
+    <p class="lead">${esc(o.open_instruction||'')}</p>
+    <div class="row">${openBtn}
+      <button class="ghost" onclick="toggleOutcomeEdit()">Edit folder / command / URL</button>
+    </div>
+    <div class="hidden" id="outcome-edit">
+      <label>Folder</label><input id="oc-folder" value="${esc(o.folder)}">
+      <label>Test command</label><input id="oc-cmd" value="${esc(o.test_command)}">
+      <label>Test URL</label><input id="oc-url" value="${esc(o.test_url)}">
+      <label>Notes / blockers</label><textarea id="oc-notes">${esc(o.notes)}</textarea>
+      <div class="row"><button onclick="saveOutcomeEdit('${o.job_id}')">Save</button></div>
+    </div>`;
+}
+function toggleOutcomeEdit(){
+  $('outcome-edit').classList.toggle('hidden');
+}
+async function saveOutcomeEdit(jobId){
+  const body={folder:$('oc-folder').value,test_command:$('oc-cmd').value,
+    test_url:$('oc-url').value,blockers:$('oc-notes').value};
+  const r=await post(`/api/outcomes/${jobId}/edit`,body);
+  if(r.error){alert(r.error);return;}
+  await refreshStage();
 }
 
 function reportSummary(report){

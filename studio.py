@@ -34,6 +34,7 @@ REPORTS_DIR = os.path.join(ROOT, "reports")
 PROJECTS_DIR = os.path.join(ROOT, "projects")
 DASHBOARD_PATH = os.path.join(ROOT, "dashboard.html")
 GUIDED_PATH = os.path.join(ROOT, "guided.html")
+OUTCOMES_PATH = os.path.join(ROOT, "outcomes.html")
 
 PROJECTS_PATH = os.path.join(STATE_DIR, "projects.json")
 JOBS_PATH = os.path.join(STATE_DIR, "jobs.jsonl")
@@ -102,7 +103,10 @@ COMMIT: <hash>
 PR: <number or none>
 BLOCKERS: <none | description>
 NEXT ACTION: <text>
-NEEDS APPROVAL: <yes|no>"""
+NEEDS APPROVAL: <yes|no>
+FOLDER: <exact absolute path this was built/run in, or none>
+TEST COMMAND: <exact command Chris can run locally to see it working, or none>
+TEST URL: <exact local URL Chris can open in a browser, or none>"""
 
 # The seed project registry. This is the CODE-side source of truth; on first run
 # it is written into state/projects.json (gitignored) so Chris's live edits
@@ -680,20 +684,33 @@ _REPORT_FIELD_PATTERNS = {
     "needs_approval": r"^NEEDS APPROVAL:\s*(.+)$",
 }
 
+# Added for the Finished Outcome screen. Optional: not required for parsed_ok,
+# since most historical reports (and Claude Code runs that predate this) never
+# included them — Chris can always fill these in by hand afterward instead.
+_OPTIONAL_REPORT_FIELD_PATTERNS = {
+    "folder": r"^FOLDER:\s*(.+)$",
+    "test_command": r"^TEST COMMAND:\s*(.+)$",
+    "test_url": r"^TEST URL:\s*(.+)$",
+}
+
 
 def parse_claude_report(raw):
     """Best-effort line parser matching FINAL_STATUS_FORMAT labels. Tolerant of
     case and stray whitespace. Returns (fields, parsed_ok) — parsed_ok is True
-    only if every labeled field was found; otherwise the raw text is always kept
-    so nothing is lost, and Chris can fill in fields manually."""
+    only if every REQUIRED labeled field was found; optional fields (folder,
+    test_command, test_url) are parsed too but never affect parsed_ok. The raw
+    text is always kept so nothing is lost, and Chris can fill in fields
+    manually."""
     fields = {k: None for k in _REPORT_FIELD_PATTERNS}
+    fields.update({k: None for k in _OPTIONAL_REPORT_FIELD_PATTERNS})
+    all_patterns = {**_REPORT_FIELD_PATTERNS, **_OPTIONAL_REPORT_FIELD_PATTERNS}
     for line in raw.splitlines():
         line = line.strip()
-        for key, pattern in _REPORT_FIELD_PATTERNS.items():
+        for key, pattern in all_patterns.items():
             m = re.match(pattern, line, re.IGNORECASE)
             if m:
                 fields[key] = m.group(1).strip()
-    parsed_ok = all(v is not None for v in fields.values())
+    parsed_ok = all(fields[k] is not None for k in _REPORT_FIELD_PATTERNS)
     if fields.get("needs_approval") is not None:
         fields["needs_approval"] = fields["needs_approval"].strip().lower() in ("yes", "true")
     return fields, parsed_ok
@@ -721,13 +738,59 @@ class ReportStore:
         raw = str(raw or "")
         fields, parsed_ok = parse_claude_report(raw)
         if manual:
-            fields.update({k: v for k, v in manual.items() if k in _REPORT_FIELD_PATTERNS})
+            fields.update({k: v for k, v in manual.items() if k in fields})
         rec = {"id": _id(), "job_id": job_id, "project": project, "raw": raw,
               "parsed_ok": parsed_ok, "created_at": time.time(), **fields}
         self.reports[rec["id"]] = rec
         _jsonl_append(REPORTS_PATH, rec)
         save_claude_report_to_folder(project, raw)
         return rec
+
+    def amend(self, report_id, **overrides):
+        """Let Chris correct/fill in outcome fields after the fact (folder, test
+        command, test URL, blockers/notes) — e.g. when Claude Code's report
+        omitted them, or got the folder wrong, as happened with Decision Deck.
+        Same last-write-wins JSONL pattern as JobStore.advance()."""
+        rec = self.reports.get(report_id)
+        if rec is None:
+            raise NotFound(f"unknown report: {report_id}")
+        allowed = {"folder", "test_command", "test_url", "blockers"}
+        updates = {k: str(v).strip() for k, v in overrides.items()
+                  if k in allowed and v is not None}
+        rec = dict(rec, **updates)
+        self.reports[rec["id"]] = rec
+        _jsonl_append(REPORTS_PATH, rec)
+        return rec
+
+
+def build_outcome(job, project, report):
+    """The 'Finished Outcome' record for one job: where it lives, how to see it
+    running, and what's left. Folder/test command/test URL come from the
+    Claude Code report when it declared them; folder falls back to the
+    project's registered repo_path otherwise. Chris can always correct any of
+    these afterward (ReportStore.amend) — this is exactly the gap Decision
+    Deck exposed: the build finished but nothing recorded or showed where it
+    actually landed."""
+    folder = (report.get("folder") if report else None) or project.get("repo_path") or ""
+    test_command = (report.get("test_command") if report else None) or ""
+    test_url = (report.get("test_url") if report else None) or ""
+    if test_url:
+        open_instruction = f"Open {test_url} in your browser."
+    elif folder:
+        open_instruction = f"Open the project folder: {folder}"
+    else:
+        open_instruction = "No folder or URL recorded yet — edit this outcome to add one."
+    return {
+        "job_id": job["id"], "project": job["project"], "project_name": project["name"],
+        "job_status": job["status"],
+        "status": (report.get("status") if report else None) or job["status"],
+        "folder": folder, "test_command": test_command, "test_url": test_url,
+        "files_changed": (report.get("files_changed") if report else None) or "",
+        "notes": (report.get("blockers") if report else None) or "",
+        "report_id": report["id"] if report else None,
+        "open_instruction": open_instruction,
+        "completed_at": report["created_at"] if report else job["updated_at"],
+    }
 
 
 # ── decisions / risks / notes ───────────────────────────────────────────────────
@@ -1166,17 +1229,22 @@ def _guided_stage_from_job(job, room, project, reports):
                    prompt=build_claude_code_build_prompt(job, project))
     if status in ("Sent to Claude", "Building"):
         return dict(base, kind="claude_code_report")
+    latest = None
+    if reports is not None:
+        recs = reports.list(job_id=job["id"])
+        latest = recs[0] if recs else None
+    # Testing onward always carries the Finished Outcome data (folder, test
+    # command/URL, files changed, notes) so Chris never again reaches the end
+    # of a build without a clear "here's what to open" answer.
     if status in ("Testing", "Needs Chris Approval"):
-        latest = None
-        if reports is not None:
-            recs = reports.list(job_id=job["id"])
-            latest = recs[0] if recs else None
         return dict(base, kind=("test_review" if status == "Testing" else "needs_approval"),
-                   latest_report=latest)
+                   latest_report=latest, outcome=build_outcome(job, project, latest))
     if status == "Approved":
-        return dict(base, kind="complete", needs_final_click=True, archived=False)
+        return dict(base, kind="complete", needs_final_click=True, archived=False,
+                   outcome=build_outcome(job, project, latest))
     if status in ("Completed", "Archived"):
-        return dict(base, kind="complete", needs_final_click=False, archived=status == "Archived")
+        return dict(base, kind="complete", needs_final_click=False, archived=status == "Archived",
+                   outcome=build_outcome(job, project, latest))
     return dict(base, kind="stalled", reason=f"Job stuck at unhandled status: {status}")
 
 
@@ -1250,6 +1318,26 @@ def guided_complete(jobs, job_id):
     if job["status"] == "Completed":
         return jobs.advance(job_id, "Archived")
     return job
+
+
+def list_outcomes(projects, jobs, reports):
+    """Every finished build across all projects, for the 'Built Projects /
+    Outcomes' page — anything that has cleared the approval gate (or never
+    needed one): Approved, Completed, or Archived. Newest first."""
+    out = []
+    for job in jobs.list():
+        if job["status"] not in ("Approved", "Completed", "Archived"):
+            continue
+        try:
+            project = get_project(projects, job["project"])
+        except NotFound:
+            continue
+        recs = reports.list(job_id=job["id"])
+        latest = recs[0] if recs else None
+        outcome = build_outcome(job, project, latest)
+        outcome["open_available"] = bool(outcome["test_url"])
+        out.append(outcome)
+    return sorted(out, key=lambda o: o["completed_at"], reverse=True)
 
 
 # ── cross-cutting: needs-chris, project memory, where-are-we, continuity ───────
@@ -1913,6 +2001,9 @@ class Handler(BaseHTTPRequestHandler):
                 stage = compute_guided_stage(m.group(1), self.projects, self.jobs, self.rooms,
                                              self.reports)
                 return self._send(200, stage)
+            if path == "/api/outcomes":
+                return self._send(200, {"outcomes": list_outcomes(self.projects, self.jobs,
+                                                                   self.reports)})
             m = re.match(rf"^/api/project/({_PID_RE})/timeline$", path)
             if m:
                 get_project(self.projects, m.group(1))
@@ -1971,6 +2062,12 @@ class Handler(BaseHTTPRequestHandler):
                         return self._send(200, f.read(), "text/html; charset=utf-8")
                 except OSError:
                     return self._send(404, {"error": "dashboard missing"})
+            if path in ("/outcomes", "/outcomes.html"):
+                try:
+                    with open(OUTCOMES_PATH, "rb") as f:
+                        return self._send(200, f.read(), "text/html; charset=utf-8")
+                except OSError:
+                    return self._send(404, {"error": "outcomes page missing"})
             return self._send(404, {"error": "not found"})
         except NotFound as e:
             return self._send(404, {"error": str(e)})
@@ -2289,6 +2386,22 @@ class Handler(BaseHTTPRequestHandler):
                 guided_complete(self.jobs, stage["job_id"])
                 self._sync(pid)
                 return self._send(200, compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports))
+            m = re.match(rf"^/api/outcomes/({_UUID_RE})/edit$", path)
+            if m:
+                jid = m.group(1)
+                job = self.jobs.get(jid)
+                project = get_project(self.projects, job["project"])
+                b = self._body()
+                overrides = {k: b.get(k) for k in
+                            ("folder", "test_command", "test_url", "blockers") if k in b}
+                recs = self.reports.list(job_id=jid)
+                if recs:
+                    rec = self.reports.amend(recs[0]["id"], **overrides)
+                else:
+                    rec = self.reports.ingest(jid, job["project"],
+                                              "(no Claude Code report on file — outcome recorded by hand)",
+                                              manual=overrides)
+                return self._send(200, build_outcome(job, project, rec))
 
             return self._send(404, {"error": "not found"})
         except NotFound as e:

@@ -1349,7 +1349,11 @@ class TestGuidedBuildApprovalGate(Base):
         self.assertEqual(job2["status"], "Archived")   # no-op once archived
 
 
-class TestGuidedBuildHTTP(Base):
+class _HTTPBase(Base):
+    """Shared boilerplate for tests that need a live Studio server. Not a
+    TestCase with its own test_ methods — subclass this, don't subclass a
+    sibling test class, or unittest will silently re-run the sibling's tests
+    a second time under the new name."""
     def setUp(self):
         super().setUp()
         s.build_app_state()
@@ -1379,6 +1383,8 @@ class TestGuidedBuildHTTP(Base):
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read().decode() or "{}")
 
+
+class TestGuidedBuildHTTP(_HTTPBase):
     def test_create_project_endpoint(self):
         code, p = self._req("/api/projects", {"name": "New Thing", "kind": "new"})
         self.assertEqual((code, p["id"]), (201, "new-thing"))
@@ -1419,6 +1425,142 @@ class TestGuidedBuildHTTP(Base):
             self.assertEqual(r.status, 200)
             self.assertIn(b"<html", r.read()[:200].lower())
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/advanced", timeout=5) as r:
+            self.assertEqual(r.status, 200)
+            self.assertIn(b"<html", r.read()[:200].lower())
+
+
+# ─── finished outcome screen ─────────────────────────────────────────────────
+
+_OUTCOME_EXTRA_LINES = ("\nFOLDER: /home/user/decision-deck\n"
+                       "TEST COMMAND: npm start\nTEST URL: http://localhost:5173")
+
+
+class TestOutcomeParsing(Base):
+    def test_optional_fields_parsed_without_affecting_parsed_ok(self):
+        raw = TestClaudeReportIngestion.GOOD_REPORT + _OUTCOME_EXTRA_LINES
+        fields, ok = s.parse_claude_report(raw)
+        self.assertTrue(ok)
+        self.assertEqual(fields["folder"], "/home/user/decision-deck")
+        self.assertEqual(fields["test_command"], "npm start")
+        self.assertEqual(fields["test_url"], "http://localhost:5173")
+
+    def test_missing_optional_fields_still_parsed_ok(self):
+        fields, ok = s.parse_claude_report(TestClaudeReportIngestion.GOOD_REPORT)
+        self.assertTrue(ok)
+        self.assertIsNone(fields["folder"])
+        self.assertIsNone(fields["test_command"])
+        self.assertIsNone(fields["test_url"])
+
+
+class TestReportAmend(Base):
+    def test_amend_updates_editable_fields_only(self):
+        job = self.make_job(project="veracore")
+        rec = self.reports.ingest(job["id"], "veracore", TestClaudeReportIngestion.GOOD_REPORT)
+        amended = self.reports.amend(rec["id"], folder="/home/user/decision-deck",
+                                     test_command="npm start", test_url="http://localhost:5173",
+                                     blockers="none really")
+        self.assertEqual(amended["folder"], "/home/user/decision-deck")
+        self.assertEqual(amended["test_command"], "npm start")
+        self.assertEqual(amended["test_url"], "http://localhost:5173")
+        self.assertEqual(amended["blockers"], "none really")
+        self.assertEqual(amended["commit"], "abc1234")   # untouched fields survive
+
+    def test_amend_unknown_report_raises_not_found(self):
+        with self.assertRaises(s.NotFound):
+            self.reports.amend("nope")
+
+
+class TestBuildOutcome(Base):
+    def test_folder_falls_back_to_project_repo_path_when_report_omits_it(self):
+        job = self.make_job(project="veracore")
+        rec = self.reports.ingest(job["id"], "veracore", TestClaudeReportIngestion.GOOD_REPORT)
+        outcome = s.build_outcome(job, self.projects["veracore"], rec)
+        self.assertEqual(outcome["folder"], self.projects["veracore"]["repo_path"])
+        self.assertIn("Open the project folder", outcome["open_instruction"])
+
+    def test_report_folder_and_test_url_take_priority_and_drive_open_instruction(self):
+        job = self.make_job(project="veracore")
+        raw = TestClaudeReportIngestion.GOOD_REPORT + _OUTCOME_EXTRA_LINES
+        rec = self.reports.ingest(job["id"], "veracore", raw)
+        outcome = s.build_outcome(job, self.projects["veracore"], rec)
+        self.assertEqual(outcome["folder"], "/home/user/decision-deck")
+        self.assertEqual(outcome["test_command"], "npm start")
+        self.assertEqual(outcome["test_url"], "http://localhost:5173")
+        self.assertIn("http://localhost:5173", outcome["open_instruction"])
+
+    def test_no_report_falls_back_to_job_status_and_project_folder(self):
+        job = self.make_job(project="veracore")
+        outcome = s.build_outcome(job, self.projects["veracore"], None)
+        self.assertEqual(outcome["status"], job["status"])
+        self.assertEqual(outcome["folder"], self.projects["veracore"]["repo_path"])
+        self.assertEqual(outcome["test_url"], "")
+
+
+class TestListOutcomes(Base):
+    def test_no_finished_jobs_yields_empty_list(self):
+        self.make_job(project="veracore")   # stays Draft — not finished
+        self.assertEqual(s.list_outcomes(self.projects, self.jobs, self.reports), [])
+
+    def test_completed_job_appears_with_outcome_fields(self):
+        pid = "veracore"
+        room = s.start_guided_build(pid, self.jobs, self.rooms, "Add a widget")
+        self.rooms.paste_chatgpt_response(room["id"], "x")
+        self.rooms.paste_claude_response(room["id"], "y")
+        stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports)
+        job, room, _ = s.guided_approve_plan(self.projects, self.rooms, self.notes, pid,
+                                             room["id"], stage["plan_draft"])
+        s.guided_sent_to_claude_code(self.jobs, job["id"])
+        s.guided_claude_code_report(self.jobs, self.reports, job["id"], pid,
+                                    TestClaudeReportIngestion.GOOD_REPORT)
+        s.guided_continue_after_test(self.jobs, job["id"])   # GOOD_REPORT: needs_approval no -> Completed
+        outcomes = s.list_outcomes(self.projects, self.jobs, self.reports)
+        self.assertEqual(len(outcomes), 1)
+        self.assertEqual(outcomes[0]["project"], "veracore")
+        self.assertEqual(outcomes[0]["job_status"], "Completed")
+        self.assertFalse(outcomes[0]["open_available"])   # GOOD_REPORT has no TEST URL
+
+
+class TestOutcomesHTTP(_HTTPBase):
+    def test_outcomes_endpoint_lists_and_edit_updates(self):
+        pid = "veracore"
+        self._req(f"/api/guided/{pid}/start", {"idea": "Add a widget"})
+        self._req(f"/api/guided/{pid}/chatgpt-response", {"text": "x"})
+        code, stage = self._req(f"/api/guided/{pid}/claude-response", {"text": "y"})
+        self._req(f"/api/guided/{pid}/approve-plan", {"plan_text": stage["plan_draft"]})
+        self._req(f"/api/guided/{pid}/sent-to-claude-code", {})
+        code, stage = self._req(f"/api/guided/{pid}/claude-code-report",
+                                {"raw": TestClaudeReportIngestion.GOOD_REPORT})
+        job_id = stage["job_id"]
+        self._req(f"/api/guided/{pid}/continue-after-test", {})
+
+        code, data = self._req("/api/outcomes")
+        self.assertEqual(code, 200)
+        self.assertEqual(len(data["outcomes"]), 1)
+        self.assertEqual(data["outcomes"][0]["job_id"], job_id)
+
+        code, updated = self._req(f"/api/outcomes/{job_id}/edit",
+                                  {"folder": "/home/user/decision-deck",
+                                   "test_command": "npm start",
+                                   "test_url": "http://localhost:5173"})
+        self.assertEqual(code, 200)
+        self.assertEqual(updated["folder"], "/home/user/decision-deck")
+        self.assertEqual(updated["test_url"], "http://localhost:5173")
+
+        code, data = self._req("/api/outcomes")
+        self.assertEqual(data["outcomes"][0]["test_url"], "http://localhost:5173")
+
+    def test_edit_with_no_prior_report_creates_a_manual_one(self):
+        job = self.make_job(project="veracore", approval_required=False)
+        for status in ("Planning", "Ready for ChatGPT", "ChatGPT Planned", "Ready for Claude",
+                      "Sent to Claude", "Building", "Testing", "Completed"):
+            self.jobs.advance(job["id"], status)
+        code, updated = self._req(f"/api/outcomes/{job['id']}/edit",
+                                  {"folder": "/home/user/manually-found-folder"})
+        self.assertEqual(code, 200)
+        self.assertEqual(updated["folder"], "/home/user/manually-found-folder")
+
+    def test_outcomes_page_serves_html(self):
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/outcomes", timeout=5) as r:
             self.assertEqual(r.status, 200)
             self.assertIn(b"<html", r.read()[:200].lower())
 

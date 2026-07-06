@@ -12,7 +12,10 @@
        font:14px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}
   header{display:flex;align-items:baseline;gap:14px;padding:14px 20px;border-bottom:1px solid var(--line)}
   h1{font-size:17px;margin:0}
-  .tag{color:var(--dim);font-size:12px}
+  .tag{color:var(--dim);font-size:12px;flex:1}
+  a.nav{color:var(--dim);font-size:12px;text-decoration:none;border:1px solid var(--line);
+       border-radius:7px;padding:4px 10px;white-space:nowrap}
+  a.nav:hover{color:var(--accent);border-color:var(--accent)}
   #needs-chris{display:none;margin:0 20px;background:#3a1420;border:1px solid var(--bad);
        color:var(--bad);border-radius:10px;padding:10px 16px}
   #needs-chris b{color:#fff}
@@ -79,6 +82,8 @@
 <header>
   <h1>GNG Development Studio</h1>
   <span class="tag">build coordination cockpit · <span id="hmode">…</span></span>
+  <a class="nav" href="/outcomes">Built Projects →</a>
+  <a class="nav" href="/">← Guided build</a>
 </header>
 <div id="needs-chris"><b>⚠ Needs Chris</b><div id="needs-chris-items"></div></div>
 <main>

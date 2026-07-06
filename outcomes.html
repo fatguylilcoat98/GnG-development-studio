@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Built Projects — GNG Development Studio</title>
+<style>
+  :root{--bg:#0b1020;--panel:#121a30;--line:#22304f;--txt:#dbe4f5;--dim:#8ea0c0;
+        --ok:#3ecf8e;--bad:#ff6b6b;--warn:#ffc857;--accent:#5aa7ff}
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font:15px/1.6 system-ui,-apple-system,Segoe UI,sans-serif;min-height:100vh}
+  header{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;padding:16px 24px;border-bottom:1px solid var(--line)}
+  h1{font-size:19px;margin:0}
+  .tag{color:var(--dim);font-size:12.5px;flex:1}
+  a.nav{color:var(--dim);font-size:12.5px;text-decoration:none;border:1px solid var(--line);
+       border-radius:7px;padding:5px 11px;white-space:nowrap}
+  a.nav:hover{color:var(--accent);border-color:var(--accent)}
+  main{max-width:760px;margin:0 auto;padding:32px 20px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px;margin-bottom:16px}
+  h2{font-size:15px;margin:0 0 18px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em}
+  h3{font-size:18px;margin:0}
+  p.lead{color:var(--dim);margin-top:0}
+  label{display:block;font-size:13px;color:var(--dim);margin:14px 0 6px}
+  input,textarea,select{background:#0d1426;border:1px solid var(--line);color:var(--txt);
+       border-radius:8px;padding:12px;font:inherit;font-size:16px;width:100%}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:14px}
+  button{background:var(--accent);color:#08111f;border:0;border-radius:9px;
+         padding:11px 18px;font-weight:700;cursor:pointer;font-size:14.5px;min-height:44px}
+  button.ghost{background:transparent;color:var(--accent);border:1px solid var(--line)}
+  a.open-btn{display:inline-block;background:var(--ok);color:#08111f;border-radius:9px;
+       padding:11px 18px;font-weight:700;text-decoration:none;font-size:14.5px}
+  .badge{display:inline-block;border-radius:6px;padding:2px 9px;font-size:12px;font-weight:700}
+  .badge.complete{background:#123626;color:var(--ok)}
+  .badge.blocked{background:#3a1414;color:var(--bad)}
+  .badge.other{background:#1a2440;color:var(--dim)}
+  .top{display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap}
+  .date{color:var(--dim);font-size:12.5px}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:14px;margin:14px 0}
+  .kv b{color:var(--dim);font-weight:600;font-size:12.5px}
+  .kv span{word-break:break-word;overflow-wrap:anywhere}
+  .kv code{background:#0d1426;border:1px solid var(--line);border-radius:6px;padding:2px 6px;font-size:13px}
+  .dim{color:var(--dim)}
+  .empty{color:var(--dim);text-align:center;padding:40px 0}
+  .hidden{display:none}
+  @media (max-width:600px){
+    main{padding:16px 10px}
+    .card{padding:16px 14px}
+    header{padding:12px 14px}
+    h1{font-size:17px}
+    .tag{flex:1 1 100%;order:3;font-size:12px}
+    .kv{grid-template-columns:1fr}
+    .kv b{margin-top:8px}
+    .kv b:first-child{margin-top:0}
+    .row{flex-direction:column;align-items:stretch}
+    .row button, .row a.open-btn{width:100%;text-align:center}
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Built Projects</h1>
+  <span class="tag">outcomes</span>
+  <a class="nav" href="/">← Guided build</a>
+  <a class="nav" href="/advanced">Advanced view →</a>
+</header>
+<main>
+  <div id="list">Loading…</div>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+function esc(s){const d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML;}
+async function j(url,opts){const r=await fetch(url,opts);return r.json();}
+async function post(url,body){return j(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});}
+
+function statusBadge(status){
+  const s=(status||'').toLowerCase();
+  const cls=s.includes('block')?'blocked':(s.includes('complete')?'complete':'other');
+  return `<span class="badge ${cls}">${esc(status||'unknown')}</span>`;
+}
+function fmtDate(ts){
+  if(!ts)return '';
+  const d=new Date(ts*1000);
+  return d.toLocaleString(undefined,{dateStyle:'medium',timeStyle:'short'});
+}
+
+function outcomeCard(o){
+  const openBtn=o.test_url
+    ? `<a class="open-btn" href="${esc(o.test_url)}" target="_blank" rel="noopener">Open →</a>`
+    : `<span class="dim">No URL recorded</span>`;
+  return `<div class="card">
+    <div class="top">
+      <h3>${esc(o.project_name)}</h3>
+      <span class="date">${esc(fmtDate(o.completed_at))}</span>
+    </div>
+    <div class="row" style="margin-top:8px">${statusBadge(o.status)}</div>
+    <div class="kv">
+      <b>Folder</b><span><code>${esc(o.folder||'(not recorded)')}</code></span>
+      <b>Test command</b><span><code>${esc(o.test_command||'(not recorded)')}</code></span>
+      <b>Test URL</b><span>${o.test_url?`<code>${esc(o.test_url)}</code>`:'(not recorded)'}</span>
+      <b>Files changed</b><span>${esc(o.files_changed||'—')}</span>
+      <b>Notes / blockers</b><span>${esc(o.notes||'—')}</span>
+    </div>
+    <div class="row">
+      ${openBtn}
+      <button class="ghost" onclick="toggleEdit('${o.job_id}')">Edit</button>
+    </div>
+    <div class="hidden" id="edit-${o.job_id}" style="margin-top:12px">
+      <label>Folder</label><input id="f-folder-${o.job_id}" value="${esc(o.folder)}">
+      <label>Test command</label><input id="f-cmd-${o.job_id}" value="${esc(o.test_command)}">
+      <label>Test URL</label><input id="f-url-${o.job_id}" value="${esc(o.test_url)}">
+      <label>Notes / blockers</label><textarea id="f-notes-${o.job_id}">${esc(o.notes)}</textarea>
+      <div class="row"><button onclick="saveEdit('${o.job_id}')">Save</button></div>
+    </div>
+  </div>`;
+}
+
+function toggleEdit(jobId){
+  $(`edit-${jobId}`).classList.toggle('hidden');
+}
+async function saveEdit(jobId){
+  const body={
+    folder: $(`f-folder-${jobId}`).value,
+    test_command: $(`f-cmd-${jobId}`).value,
+    test_url: $(`f-url-${jobId}`).value,
+    blockers: $(`f-notes-${jobId}`).value,
+  };
+  const r=await post(`/api/outcomes/${jobId}/edit`,body);
+  if(r.error){alert(r.error);return;}
+  await load();
+}
+
+async function load(){
+  const data=await j('/api/outcomes');
+  const outcomes=data.outcomes||[];
+  if(!outcomes.length){
+    $('list').innerHTML='<div class="empty">No finished builds yet. Once a build reaches Approved, Completed, or Archived, it shows up here.</div>';
+    return;
+  }
+  $('list').innerHTML=outcomes.map(outcomeCard).join('');
+}
+load();
+</script>
+</body>
+</html>
