@@ -594,6 +594,57 @@ class TestHTTP(Base):
     def test_unknown_paths_404(self):
         self.assertEqual(self._req("/api/nope")[0], 404)
 
+    def test_search_endpoint(self):
+        self._req("/api/jobs", {"project": "veracore", "title": "Findable qwerty123",
+                                "description": "d"})
+        code, r = self._req("/api/search?q=qwerty123")
+        self.assertEqual((code, len(r["jobs"])), (200, 1))
+
+    def test_inbox_endpoint(self):
+        code, r = self._req("/api/jobs", {"project": "veracore", "title": "t", "description": "d"})
+        self._req(f"/api/jobs/{r['id']}/generate-chatgpt-prompt", {})
+        code, inbox = self._req("/api/inbox")
+        self.assertEqual(code, 200)
+        self.assertTrue(any(it["id"] == r["id"] for it in inbox["items"]))
+
+    def test_timeline_endpoint(self):
+        self._req("/api/jobs", {"project": "veracore", "title": "t", "description": "d"})
+        code, t = self._req("/api/project/veracore/timeline")
+        self.assertEqual(code, 200)
+        self.assertGreater(len(t["events"]), 0)
+
+    def test_continue_prompt_endpoint(self):
+        code, r = self._req("/api/project/veracore/continue-prompt")
+        self.assertEqual(code, 200)
+        self.assertIn("Use Claude Code.", r["text"])
+
+    def test_job_reject_endpoint(self):
+        _, job = self._req("/api/jobs", {"project": "veracore", "title": "t", "description": "d"})
+        for status in ["Planning", "Ready for ChatGPT", "ChatGPT Planned",
+                       "Ready for Claude", "Sent to Claude", "Building", "Testing",
+                       "Needs Chris Approval"]:
+            self._req(f"/api/jobs/{job['id']}/status", {"status": status})
+        code, r = self._req(f"/api/jobs/{job['id']}/reject", {"reason": "redo"})
+        self.assertEqual((code, r["status"]), (200, "Building"))
+
+    def test_project_file_get_and_post(self):
+        code, r = self._req("/api/project/veracore/file?name=MISSION.md")
+        self.assertEqual(code, 200)
+        code, r = self._req("/api/project/veracore/file",
+                            {"name": "ARCHITECTURE.md", "content": "New architecture text."})
+        self.assertEqual(code, 200)
+        code, r = self._req("/api/project/veracore/file?name=ARCHITECTURE.md")
+        self.assertEqual(r["content"], "New architecture text.")
+        code, r = self._req("/api/project/veracore/file",
+                            {"name": "DECISIONS.md", "content": "should be refused"})
+        self.assertEqual(code, 400)
+
+    def test_next_action_endpoint(self):
+        code, r = self._req("/api/project/veracore/next-action", {"text": "ship it"})
+        self.assertEqual(code, 200)
+        code, r = self._req("/api/project/veracore/file?name=NEXT_ACTION.md")
+        self.assertEqual(r["content"], "ship it")
+
 
 # ─── project folders: persistent, file-based per-project memory ──────────────
 
@@ -913,6 +964,203 @@ class TestNoAPIsOrAutomationAdded(Base):
         src = open(os.path.join(ROOT, "studio.py")).read()
         self.assertNotIn("import subprocess", src)
         self.assertNotIn("Popen", src)
+
+
+# ─── job reject (send back) ────────────────────────────────────────────────────
+
+class TestJobReject(Base):
+    def test_reject_only_legal_from_needs_chris_approval(self):
+        job = self.make_job()
+        with self.assertRaises(s.IllegalTransition):
+            self.jobs.reject(job["id"], "too early")
+        for status in ["Planning", "Ready for ChatGPT", "ChatGPT Planned",
+                       "Ready for Claude", "Sent to Claude", "Building", "Testing",
+                       "Needs Chris Approval"]:
+            job = self.jobs.advance(job["id"], status)
+        job = self.jobs.reject(job["id"], "needs more tests")
+        self.assertEqual(job["status"], "Building")
+        self.assertTrue(job["history"][-1]["rejected"])
+        self.assertEqual(job["history"][-1]["reason"], "needs more tests")
+
+    def test_rejected_job_can_walk_forward_again(self):
+        job = self.make_job()
+        for status in ["Planning", "Ready for ChatGPT", "ChatGPT Planned",
+                       "Ready for Claude", "Sent to Claude", "Building", "Testing",
+                       "Needs Chris Approval"]:
+            job = self.jobs.advance(job["id"], status)
+        job = self.jobs.reject(job["id"], "redo")
+        job = self.jobs.advance(job["id"], "Testing")
+        job = self.jobs.advance(job["id"], "Needs Chris Approval")
+        job = self.jobs.advance(job["id"], "Approved")
+        self.assertEqual(job["status"], "Approved")
+
+
+# ─── search ─────────────────────────────────────────────────────────────────────
+
+class TestSearch(Base):
+    def test_search_finds_jobs_notes_decisions_risks_reports_rooms(self):
+        job = self.make_job(project="veracore", title="Findable job title xyzzy")
+        self.decisions.create("veracore", "xyzzy decision")
+        self.risks.create("veracore", "xyzzy risk")
+        self.reports.ingest(job["id"], "veracore", "STATUS: Complete\nxyzzy in the report")
+        self.rooms.create("veracore", "xyzzy idea")
+        r = s.search_studio("xyzzy", self.projects, self.jobs, self.reports,
+                            self.decisions, self.risks, self.notes, self.rooms)
+        self.assertEqual(len(r["jobs"]), 1)
+        self.assertEqual(len(r["decisions"]), 1)
+        self.assertEqual(len(r["risks"]), 1)
+        self.assertEqual(len(r["reports"]), 1)
+        self.assertEqual(len(r["rooms"]), 1)
+
+    def test_search_finds_hand_edited_project_files(self):
+        s._write_project_file("veracore", "ARCHITECTURE.md", "Uses a xyzzy-based cache.")
+        r = s.search_studio("xyzzy-based", self.projects, self.jobs, self.reports,
+                            self.decisions, self.risks, self.notes, self.rooms)
+        self.assertEqual(len(r["files"]), 1)
+        self.assertEqual(r["files"][0]["file"], "ARCHITECTURE.md")
+        self.assertIn("xyzzy-based", r["files"][0]["snippet"])
+
+    def test_search_is_case_insensitive_and_project_scoped(self):
+        self.make_job(project="veracore", title="Findme")
+        self.make_job(project="aubs-os", title="findme too")
+        r_all = s.search_studio("FINDME", self.projects, self.jobs, self.reports,
+                                self.decisions, self.risks, self.notes, self.rooms)
+        self.assertEqual(len(r_all["jobs"]), 2)
+        r_scoped = s.search_studio("findme", self.projects, self.jobs, self.reports,
+                                   self.decisions, self.risks, self.notes, self.rooms,
+                                   project="veracore")
+        self.assertEqual(len(r_scoped["jobs"]), 1)
+
+    def test_empty_query_returns_nothing(self):
+        r = s.search_studio("", self.projects, self.jobs, self.reports,
+                            self.decisions, self.risks, self.notes, self.rooms)
+        self.assertEqual(r, {"jobs": [], "notes": [], "decisions": [], "risks": [],
+                            "reports": [], "rooms": [], "files": []})
+
+
+# ─── timeline ───────────────────────────────────────────────────────────────────
+
+class TestTimeline(Base):
+    def test_timeline_merges_job_and_room_history_newest_first(self):
+        job = self.make_job(project="veracore")
+        self.jobs.advance(job["id"], "Planning")
+        room = self.rooms.create("veracore", "an idea")
+        events = s.build_timeline("veracore", self.jobs, self.reports, self.decisions,
+                                  self.risks, self.rooms, self.notes)
+        kinds = [e["kind"] for e in events]
+        self.assertIn("job_status", kinds)
+        self.assertIn("planning_room", kinds)
+        # newest first
+        self.assertTrue(all(events[i]["at"] >= events[i + 1]["at"] for i in range(len(events) - 1)))
+
+    def test_timeline_includes_decisions_risks_and_reports(self):
+        job = self.make_job(project="veracore")
+        self.decisions.create("veracore", "a decision")
+        self.risks.create("veracore", "a risk")
+        self.reports.ingest(job["id"], "veracore", "STATUS: Complete")
+        events = s.build_timeline("veracore", self.jobs, self.reports, self.decisions,
+                                  self.risks, self.rooms, self.notes)
+        kinds = {e["kind"] for e in events}
+        self.assertTrue({"decision", "risk", "claude_report"} <= kinds)
+
+    def test_timeline_flags_rejected_and_emergency_skip_events(self):
+        job = self.make_job(project="veracore")
+        for status in ["Planning", "Ready for ChatGPT", "ChatGPT Planned",
+                       "Ready for Claude", "Sent to Claude", "Building", "Testing",
+                       "Needs Chris Approval"]:
+            job = self.jobs.advance(job["id"], status)
+        self.jobs.reject(job["id"], "redo this")
+        events = s.build_timeline("veracore", self.jobs, self.reports, self.decisions,
+                                  self.risks, self.rooms, self.notes)
+        self.assertTrue(any("sent back" in e["summary"] for e in events))
+
+
+# ─── AI inbox ───────────────────────────────────────────────────────────────────
+
+class TestAIInbox(Base):
+    def test_inbox_lists_jobs_and_rooms_awaiting_an_exchange(self):
+        job = self.make_job(project="veracore")
+        self.jobs.advance(job["id"], "Planning")
+        self.jobs.advance(job["id"], "Ready for ChatGPT")
+        room = self.rooms.create("aubs-os", "idea")
+        items = s.build_ai_inbox(self.projects, self.jobs, self.rooms)
+        job_items = [it for it in items if it["kind"] == "job"]
+        room_items = [it for it in items if it["kind"] == "planning_room"]
+        self.assertEqual(len(job_items), 1)
+        self.assertEqual(job_items[0]["expected"], s._JOB_INBOX_EXPECTATIONS["Ready for ChatGPT"])
+        self.assertEqual(len(room_items), 1)
+
+    def test_inbox_excludes_jobs_not_awaiting_an_exchange(self):
+        job = self.make_job(project="veracore", approval_required=False)
+        items = s.build_ai_inbox(self.projects, self.jobs, self.rooms)
+        self.assertEqual(items, [])  # Draft isn't in the inbox — nothing to copy/paste yet
+
+    def test_inbox_feeds_into_founder_report(self):
+        self.make_job(project="veracore")
+        job2 = self.jobs.advance(
+            self.jobs.create(project="veracore", title="t2", description="d2")["id"], "Planning")
+        self.jobs.advance(job2["id"], "Ready for ChatGPT")
+        studio_state = {"active_project": None}
+        data = s.build_founder_report_data(self.projects, self.jobs, self.reports,
+                                           self.decisions, self.risks, studio_state, self.rooms)
+        self.assertEqual(len(data["inbox"]), 1)
+        md = s.render_founder_report_markdown(data)
+        self.assertIn("## AI Inbox", md)
+
+
+# ─── continue project prompt ───────────────────────────────────────────────────
+
+class TestContinueProjectPrompt(Base):
+    def test_prompt_targets_claude_code_and_includes_state_and_last_report(self):
+        job = self.make_job(project="veracore", title="Resume this")
+        self.reports.ingest(job["id"], "veracore", TestClaudeReportIngestion.GOOD_REPORT)
+        s.sync_project_state("veracore", self.projects, self.jobs, self.reports,
+                             self.decisions, self.risks, self.rooms)
+        text = s.build_continue_project_prompt("veracore", self.projects, self.jobs,
+                                               self.reports, self.rooms)
+        self.assertIn("Use Claude Code.", text)
+        self.assertIn("Resume this", text)
+        self.assertIn("COMMIT: abc1234", text)
+        self.assertIn("do not restart from scratch", text)
+        for rail in s.SAFETY_RAILS:
+            self.assertIn(rail, text)
+
+    def test_prompt_handles_no_open_job_gracefully(self):
+        text = s.build_continue_project_prompt("veracore", self.projects, self.jobs,
+                                               self.reports, self.rooms)
+        self.assertIn("No open job", text)
+
+
+# ─── needs-chris queue is actionable ────────────────────────────────────────────
+
+class TestNeedsChrisActionable(Base):
+    def test_job_at_gate_gets_approve_and_send_back_choices(self):
+        job = self.make_job(project="veracore")
+        for status in ["Planning", "Ready for ChatGPT", "ChatGPT Planned",
+                       "Ready for Claude", "Sent to Claude", "Building", "Testing",
+                       "Needs Chris Approval"]:
+            job = self.jobs.advance(job["id"], status)
+        items = s.needs_chris_items(self.jobs, self.reports)
+        self.assertEqual(items[0]["job_status"], "Needs Chris Approval")
+        self.assertEqual(items[0]["choices"], ["Approve", "Send back for more work"])
+
+    def test_report_triggered_item_for_a_job_not_at_the_gate_only_offers_review(self):
+        job = self.make_job(project="veracore")
+        self.reports.ingest(job["id"], "veracore",
+                            "STATUS: Blocked\nBLOCKERS: waiting on a merge decision\n"
+                            "NEEDS APPROVAL: yes")
+        items = s.needs_chris_items(self.jobs, self.reports)
+        self.assertTrue(all(it["choices"] == ["Review the report"] for it in items))
+
+
+# ─── project file editor endpoints ─────────────────────────────────────────────
+
+class TestProjectFileEditor(Base):
+    def test_get_file_whitelist(self):
+        for name in ("MISSION.md", "ARCHITECTURE.md", "ROADMAP.md", "DECISIONS.md",
+                    "RISKS.md", "NEXT_ACTION.md", "PROJECT_STATE.md"):
+            content = s._read_project_file("veracore", name, "")
+            self.assertIsInstance(content, str)
 
 
 if __name__ == "__main__":

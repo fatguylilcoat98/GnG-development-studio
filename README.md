@@ -29,6 +29,16 @@ building anything — idea → ChatGPT direction → Claude critique → optiona
 council → unified plan → Chris's sign-off — see
 [`docs/AI_PLANNING_ROOM.md`](docs/AI_PLANNING_ROOM.md).
 
+Every project gets **persistent, version-controlled memory**
+(`projects/<slug>/`, see [`docs/PROJECT_MODEL.md`](docs/PROJECT_MODEL.md)) —
+so resuming after weeks away means opening the project, not reconstructing it.
+A **Command Center** (Search, AI Inbox, Founder Dashboard) gives a cross-project
+view; a **Timeline** gives a chronological one; the **Needs Chris** queue is
+actionable (Approve / Send back for more work); and four differently-sized
+continuity packets (Where Are We?, Continuity Packet, Start New Chat Packet,
+Continue Project) cover everything from a quick status check to a full
+Claude-Code resume prompt — see [`docs/WORKFLOW.md`](docs/WORKFLOW.md).
+
 ## What this is NOT (Phase 1)
 
 - Not CI. Not GitHub automation. Not an AI API client. Not SSH automation.

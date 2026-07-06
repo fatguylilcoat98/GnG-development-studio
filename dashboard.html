@@ -19,12 +19,17 @@
   #needs-chris .item{padding:3px 0}
   main{display:grid;gap:14px;padding:16px 20px;max-width:1620px;margin:0 auto;
        grid-template-columns:230px 1fr 320px;
-       grid-template-areas:"left center right" "bottom bottom bottom"}
+       grid-template-areas:"left center right" "bottom bottom bottom" "command command command"}
   @media(max-width:1050px){main{grid-template-columns:1fr;
-       grid-template-areas:"left" "center" "right" "bottom"}}
+       grid-template-areas:"left" "center" "right" "bottom" "command"}}
   section{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
   #pane-left{grid-area:left} #pane-center{grid-area:center}
   #pane-right{grid-area:right} #pane-bottom{grid-area:bottom}
+  #pane-command{grid-area:command}
+  .cc-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
+  @media(max-width:900px){.cc-grid{grid-template-columns:1fr}}
+  .inbox-item,.fd-block{border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-bottom:8px;background:#0d1426;font-size:12.5px}
+  .search-hit{border-bottom:1px solid var(--line);padding:5px 0;font-size:12.5px}
   h2{font-size:12px;margin:0 0 10px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em}
   h3{font-size:12px;margin:14px 0 6px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em}
   table{width:100%;border-collapse:collapse;font-size:13px}
@@ -87,10 +92,23 @@
       <button class="ghost" onclick="whereAreWe()">Where are we?</button>
       <button class="ghost" onclick="continuityPacket()">Continuity Packet</button>
       <button class="ghost" onclick="startNewChatPacket()">Start New Chat Packet</button>
+      <button class="ghost" onclick="continueProjectPrompt()">Continue Project (Claude Code)</button>
     </div>
     <pre class="copyblock" id="utility-output" style="display:none"></pre>
     <h3>Project State (PROJECT_STATE.md)</h3>
     <pre class="copyblock" id="project-state-output">Select a project.</pre>
+    <h3>Edit Project Files</h3>
+    <select id="pf-name">
+      <option value="MISSION.md">MISSION.md</option>
+      <option value="ARCHITECTURE.md">ARCHITECTURE.md</option>
+      <option value="ROADMAP.md">ROADMAP.md</option>
+      <option value="NEXT_ACTION.md">NEXT_ACTION.md</option>
+    </select>
+    <textarea id="pf-content" style="min-height:100px"></textarea>
+    <div class="row">
+      <button class="ghost" onclick="loadProjectFile()">Load</button>
+      <button onclick="saveProjectFile()">Save</button>
+    </div>
   </section>
 
   <!-- CENTER: planning room + new build request -->
@@ -212,12 +230,37 @@
       <button data-tab="decision_log" onclick="setTab('decision_log')">Decision Log</button>
       <button data-tab="risks" onclick="setTab('risks')">Risks</button>
       <button data-tab="next_steps" onclick="setTab('next_steps')">Next Steps</button>
+      <button data-tab="timeline" onclick="setTab('timeline')">Timeline</button>
     </div>
     <div id="note-add" style="display:none">
       <label>New entry<textarea id="note-content"></textarea></label>
       <button onclick="addNote()">Add</button>
     </div>
     <div id="notes"></div>
+  </section>
+
+  <!-- COMMAND CENTER: cross-project inbox, search, founder dashboard -->
+  <section id="pane-command">
+    <h2>Command Center</h2>
+    <div class="cc-grid">
+      <div>
+        <h3>AI Inbox</h3>
+        <div id="inbox-list" class="dim">Loading…</div>
+      </div>
+      <div>
+        <h3>Search</h3>
+        <input id="search-q" placeholder="Search everything…" onkeydown="if(event.key==='Enter')runSearch()">
+        <div class="row" style="margin-top:6px">
+          <label class="check"><input type="checkbox" id="search-scope"> This project only</label>
+          <button class="ghost" onclick="runSearch()">Search</button>
+        </div>
+        <div id="search-results"></div>
+      </div>
+      <div>
+        <h3>Founder Dashboard</h3>
+        <div id="founder-dashboard" class="dim">Loading…</div>
+      </div>
+    </div>
   </section>
 </main>
 <script>
@@ -461,6 +504,14 @@ async function renderNotes(){
       <pre>${esc(x.description)}</pre></div>`).join('')||'<div class="dim">No risks logged.</div>';
     return;
   }
+  if(curTab==='timeline'){
+    $('note-add').style.display='none';
+    const t=await j(`/api/project/${encodeURIComponent(curProject)}/timeline`);
+    $('notes').innerHTML=t.events.map(e=>`<div class="note"><div class="meta">
+      <span>${new Date(e.at*1000).toLocaleString()}</span><span class="pill">${esc(e.kind)}</span></div>
+      <pre>${esc(e.summary)}</pre></div>`).join('')||'<div class="dim">No history yet.</div>';
+    return;
+  }
   const noteType=TAB_TO_NOTE_TYPE[curTab];
   $('note-add').style.display=(curTab==='architecture_note'||curTab==='next_steps')?'block':'none';
   const r=await j(`/api/notes?project=${encodeURIComponent(curProject)}&type=${noteType}`);
@@ -505,21 +556,117 @@ async function refreshProjectState(){
   const r=await j(`/api/project/${curProject}/state`);
   $('project-state-output').textContent=r.content;
 }
+async function continueProjectPrompt(){
+  if(!curProject){alert('Select a project first.');return;}
+  const r=await j(`/api/project/${curProject}/continue-prompt`);
+  $('utility-output').style.display='block';$('utility-output').textContent=r.text;
+  await copyText(r.text);
+}
+async function loadProjectFile(){
+  if(!curProject){alert('Select a project first.');return;}
+  const name=$('pf-name').value;
+  const r=await j(`/api/project/${curProject}/file?name=${encodeURIComponent(name)}`);
+  if(r.error){alert(r.error);return;}
+  $('pf-content').value=r.content;
+}
+async function saveProjectFile(){
+  if(!curProject){alert('Select a project first.');return;}
+  const name=$('pf-name').value, content=$('pf-content').value;
+  let r;
+  if(name==='NEXT_ACTION.md'){
+    r=await post(`/api/project/${curProject}/next-action`,{text:content});
+  }else{
+    r=await post(`/api/project/${curProject}/file`,{name,content});
+  }
+  if(r.error){alert(r.error);return;}
+  refreshProjectState();
+  alert('Saved.');
+}
+
+async function jumpTo(project,kind,id){
+  if(project&&project!==curProject)await selectProject(project);
+  if(kind==='job'){curJob=id;await refreshJobs();renderExec();}
+  if(kind==='planning_room'){await refreshRoom();}
+}
+
+async function approveJob(jid){
+  const r=await post(`/api/jobs/${jid}/status`,{status:'Approved'});
+  if(r.error){alert(r.error);return;}
+  await refreshJobs();renderExec();refreshNeedsChris();refreshProjectState();
+}
+async function rejectJob(jid){
+  const reason=prompt('Reason for sending this back to Building:')||'';
+  const r=await post(`/api/jobs/${jid}/reject`,{reason});
+  if(r.error){alert(r.error);return;}
+  await refreshJobs();renderExec();refreshNeedsChris();refreshProjectState();
+}
+
 async function refreshNeedsChris(){
   const r=await j('/api/needs-chris');
   const box=$('needs-chris');
   if(!r.items.length){box.style.display='none';return;}
   box.style.display='block';
-  $('needs-chris-items').innerHTML=r.items.map(it=>
-    `<div class="item">${esc(it.project)}: ${esc(it.reason)} — choices: ${it.choices.map(esc).join(', ')}</div>`).join('');
+  $('needs-chris-items').innerHTML=r.items.map(it=>{
+    const jid=it.job_id;
+    let actions='';
+    if(it.job_status==='Needs Chris Approval'){
+      actions=`<button onclick="approveJob('${jid}')">Approve</button>
+        <button class="ghost" onclick="rejectJob('${jid}')">Send back</button>`;
+    }else if(jid){
+      actions=`<button class="ghost" onclick="jumpTo('${it.project}','job','${jid}')">Review</button>`;
+    }
+    return `<div class="item">${esc(it.project)}: ${esc(it.reason)} ${actions}</div>`;
+  }).join('');
+}
+
+async function refreshInbox(){
+  const r=await j('/api/inbox');
+  $('inbox-list').innerHTML=r.items.map(it=>
+    `<div class="inbox-item"><b>${esc(projects[it.project]?.name||it.project)}</b> — ${esc(it.title)}
+      <div class="dim">[${esc(it.status)}] ${esc(it.expected)}</div>
+      <button class="ghost" onclick="jumpTo('${it.project}','${it.kind}','${it.id}')">Go</button></div>`
+  ).join('')||'<div class="dim">Nothing waiting on an AI exchange.</div>';
+}
+
+async function runSearch(){
+  const q=$('search-q').value.trim();
+  if(!q){$('search-results').innerHTML='';return;}
+  const scoped=$('search-scope').checked&&curProject;
+  const url=`/api/search?q=${encodeURIComponent(q)}`+(scoped?`&project=${encodeURIComponent(curProject)}`:'');
+  const r=await j(url);
+  const rows=[];
+  r.jobs.forEach(x=>rows.push(`<div class="search-hit">📋 job · ${esc(x.project)}: ${esc(x.title)}</div>`));
+  r.notes.forEach(x=>rows.push(`<div class="search-hit">📝 ${esc(x.note_type)} · ${esc(x.project)}</div>`));
+  r.decisions.forEach(x=>rows.push(`<div class="search-hit">✅ decision · ${esc(x.project)}: ${esc(x.text.slice(0,60))}</div>`));
+  r.risks.forEach(x=>rows.push(`<div class="search-hit">⚠ risk · ${esc(x.project)}: ${esc(x.description.slice(0,60))}</div>`));
+  r.reports.forEach(x=>rows.push(`<div class="search-hit">🤖 report · ${esc(x.project)}</div>`));
+  r.rooms.forEach(x=>rows.push(`<div class="search-hit">🗣 planning room · ${esc(x.project)}: ${esc((x.chris_idea||'').slice(0,60))}</div>`));
+  r.files.forEach(x=>rows.push(`<div class="search-hit">📄 ${esc(x.file)} · ${esc(x.project)}: ${esc(x.snippet)}</div>`));
+  $('search-results').innerHTML=rows.join('')||'<div class="dim">No matches.</div>';
+}
+
+async function refreshFounderDashboard(){
+  const d=await j('/api/founder-report');
+  const ap=d.active_project;
+  const blocks=[];
+  blocks.push(`<div class="fd-block"><b>Active project</b><br>${ap?esc(ap.name):'(none set)'}</div>`);
+  blocks.push(`<div class="fd-block"><b>Active jobs</b><br>${d.active_jobs.length}</div>`);
+  blocks.push(`<div class="fd-block"><b>Needs Chris</b><br>${d.needs_chris.length} item(s)</div>`);
+  blocks.push(`<div class="fd-block"><b>AI Inbox</b><br>${d.inbox.length} item(s)</div>`);
+  blocks.push(`<div class="fd-block"><b>Open risks</b><br>${d.open_risks.length}</div>`);
+  $('founder-dashboard').innerHTML=blocks.join('');
 }
 
 (async()=>{
   await loadMeta();
   await refreshNeedsChris();
+  await refreshInbox();
+  await refreshFounderDashboard();
   const first=Object.keys(projects)[0];
   if(first)await selectProject(first);
   setInterval(refreshNeedsChris,10000);
+  setInterval(refreshInbox,10000);
+  setInterval(refreshFounderDashboard,15000);
 })();
 </script>
 </body>

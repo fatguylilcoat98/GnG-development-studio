@@ -518,6 +518,22 @@ class JobStore:
         job["updated_at"] = time.time()
         return self._save(job)
 
+    def reject(self, jid, reason=""):
+        """The one deliberate exception to forward-only progression: Chris can
+        send a job back from Needs Chris Approval to Building for more work.
+        Logged distinctly (rejected=True + reason) so it's never mistaken for
+        a normal forward step, exactly like PlanningRoomStore.emergency_skip."""
+        job = self._get(jid)
+        if job["status"] != "Needs Chris Approval":
+            raise IllegalTransition(f"can only send back a job that is at Needs Chris "
+                                    f"Approval (status is {job['status']})")
+        job = dict(job)
+        job["status"] = "Building"
+        job["history"] = job["history"] + [{"status": "Building", "at": _now(),
+                                            "rejected": True, "reason": str(reason)}]
+        job["updated_at"] = time.time()
+        return self._save(job)
+
 
 # ── prompts ─────────────────────────────────────────────────────────────────────
 def _files_allowed_block(project):
@@ -1023,10 +1039,14 @@ Do not agree blindly. Challenge assumptions."""
 
 # ── cross-cutting: needs-chris, project memory, where-are-we, continuity ───────
 def needs_chris_items(jobs, reports):
+    """Each item carries the job's CURRENT status (job_status) so a caller (the
+    dashboard's actionable queue) knows whether Approve/Send-back are legal
+    right now, or whether all it can do is jump to the job/report to review."""
     items = []
     for job in jobs.list():
         if job["status"] == "Needs Chris Approval":
             items.append({"project": job["project"], "job_id": job["id"],
+                         "job_status": job["status"],
                          "reason": "Job is waiting at Needs Chris Approval",
                          "choices": ["Approve", "Send back for more work"]})
     for r in reports.list():
@@ -1044,9 +1064,17 @@ def needs_chris_items(jobs, reports):
             reasons.append("Merge decision needed")
         if "deployment decision" in blob or "deploy decision" in blob:
             reasons.append("Deployment decision needed")
+        if not reasons:
+            continue
+        try:
+            job_status = jobs.get(r["job_id"])["status"]
+        except NotFound:
+            job_status = None
+        choices = (["Approve", "Send back for more work"] if job_status == "Needs Chris Approval"
+                  else ["Review the report"])
         for reason in reasons:
-            items.append({"project": r["project"], "job_id": r["job_id"], "reason": reason,
-                         "choices": ["Review the report", "Approve", "Reject / send back"]})
+            items.append({"project": r["project"], "job_id": r["job_id"],
+                         "job_status": job_status, "reason": reason, "choices": choices})
     seen, out = set(), []
     for it in items:
         key = (it["project"], it.get("job_id"), it["reason"])
@@ -1256,11 +1284,184 @@ def sync_project_state(pid, projects, jobs, reports, decisions, risks, rooms):
     return content
 
 
+# ── search: plain substring search across every artifact ──────────────────────
+def _snippet(content, q, window=80):
+    idx = content.lower().find(q.lower())
+    if idx == -1:
+        return content[:window]
+    start, end = max(0, idx - window // 2), min(len(content), idx + len(q) + window // 2)
+    prefix, suffix = ("…" if start > 0 else ""), ("…" if end < len(content) else "")
+    return prefix + content[start:end].strip() + suffix
+
+
+PROJECT_SEARCHABLE_FILES = ("MISSION.md", "ARCHITECTURE.md", "ROADMAP.md",
+                           "DECISIONS.md", "RISKS.md", "NEXT_ACTION.md")
+
+
+def search_studio(query, projects, jobs, reports, decisions, risks, notes, rooms, project=None):
+    """Case-insensitive substring search across jobs, notes, decisions, risks,
+    reports, planning rooms, and the hand-edited project files. No indexing —
+    this is a coordination tool, not a search engine; a linear scan is plenty."""
+    q = str(query or "").strip().lower()
+    empty = {"jobs": [], "notes": [], "decisions": [], "risks": [], "reports": [],
+            "rooms": [], "files": []}
+    if not q:
+        return empty
+
+    def hit(*vals):
+        return any(q in str(v or "").lower() for v in vals)
+
+    def scoped(items_project):
+        return project is None or items_project == project
+
+    job_hits = [j for j in jobs.list() if scoped(j["project"])
+               and hit(j["title"], j["description"], j["constraints"], j["safety_notes"])]
+    note_hits = [n for n in notes.list() if scoped(n["project"])
+                and hit(n.get("content"), n.get("plan_summary"), n.get("recommended_prompt"),
+                       n.get("next_step"))]
+    decision_hits = [d for d in decisions.list() if scoped(d["project"]) and hit(d["text"])]
+    risk_hits = [r for r in risks.list() if scoped(r["project"]) and hit(r["description"])]
+    report_hits = [r for r in reports.list() if scoped(r["project"]) and hit(r.get("raw"))]
+    room_hits = [rm for rm in rooms.list() if scoped(rm["project"])
+                and hit(rm.get("chris_idea"), rm.get("chatgpt_response"), rm.get("claude_response"),
+                       rm.get("disagreements"), rm.get("unified_plan"),
+                       " ".join(c.get("content", "") for c in rm.get("council_responses", [])))]
+
+    file_hits = []
+    search_pids = [project] if project else list(projects.keys())
+    for pid in search_pids:
+        for fname in PROJECT_SEARCHABLE_FILES:
+            content = _read_project_file(pid, fname, "")
+            if content and q in content.lower():
+                file_hits.append({"project": pid, "file": fname, "snippet": _snippet(content, q)})
+
+    return {"jobs": job_hits, "notes": note_hits, "decisions": decision_hits,
+           "risks": risk_hits, "reports": report_hits, "rooms": room_hits, "files": file_hits}
+
+
+# ── timeline: one chronological feed per project ───────────────────────────────
+def _parse_iso(ts):
+    import calendar
+    return calendar.timegm(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ"))
+
+
+def _epoch_to_iso(epoch):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+def build_timeline(pid, jobs, reports, decisions, risks, rooms, notes):
+    """Merges job/room status history, decisions, risks, reports, and saved
+    prompts into one chronological (newest-first) feed for a project — sourced
+    from data already logged elsewhere, not a new store of its own."""
+    events = []
+    for j in jobs.list(project=pid, include_deleted=True):
+        for h in j["history"]:
+            summary = f"Job “{j['title']}” → {h['status']}"
+            if h.get("rejected"):
+                summary += f" (sent back: {h.get('reason', '')})" if h.get("reason") else " (sent back)"
+            events.append({"at": _parse_iso(h["at"]), "at_iso": h["at"], "kind": "job_status",
+                          "summary": summary, "job_id": j["id"]})
+    for r in rooms.list(project=pid):
+        for h in r["history"]:
+            summary = f"Planning room → {h['status']}"
+            if h.get("emergency_skip"):
+                summary += f" (emergency skip: {h.get('reason', '')})"
+            events.append({"at": _parse_iso(h["at"]), "at_iso": h["at"], "kind": "planning_room",
+                          "summary": summary, "room_id": r["id"]})
+    for d in decisions.list(project=pid):
+        events.append({"at": d["created_at"], "at_iso": _epoch_to_iso(d["created_at"]),
+                      "kind": "decision", "summary": f"Decision: {d['text']}"})
+    for rk in risks.list(project=pid):
+        events.append({"at": rk["created_at"], "at_iso": _epoch_to_iso(rk["created_at"]),
+                      "kind": "risk", "summary": f"Risk logged: {rk['description']}"})
+    for rep in reports.list(project=pid):
+        events.append({"at": rep["created_at"], "at_iso": _epoch_to_iso(rep["created_at"]),
+                      "kind": "claude_report",
+                      "summary": f"Claude report pasted (status: {rep.get('status') or 'unparsed'})",
+                      "job_id": rep.get("job_id")})
+    for n in notes.list(project=pid):
+        if n["note_type"] in ("chatgpt_plan", "chatgpt_plan_response", "claude_code_prompt"):
+            label = n["note_type"].replace("_", " ").title()
+            events.append({"at": n["created_at"], "at_iso": _epoch_to_iso(n["created_at"]),
+                          "kind": n["note_type"], "summary": f"{label} saved",
+                          "job_id": n.get("job_id")})
+    events.sort(key=lambda e: e["at"], reverse=True)
+    return events
+
+
+# ── AI inbox: cross-project view of everything waiting on an exchange ─────────
+_JOB_INBOX_EXPECTATIONS = {
+    "Ready for ChatGPT": "Copy the ChatGPT prompt and send it",
+    "ChatGPT Planned": "Copy the Claude Code build prompt, or continue planning",
+    "Ready for Claude": "Copy the Claude Code build prompt and send it",
+    "Sent to Claude": "Waiting on Claude Code — mark Building once it starts",
+    "Building": "Waiting on Claude Code to finish and report back",
+}
+_ROOM_INBOX_EXPECTATIONS = {
+    "Idea": "Copy the ChatGPT prompt and paste the response back",
+    "ChatGPT Reviewed": "Copy the Claude prompt and paste the response back",
+    "Claude Reviewed": "Optional council round, or generate the unified plan",
+    "Council Needed": "Paste council/other-AI responses, then generate the unified plan",
+}
+
+
+def build_ai_inbox(projects, jobs, rooms):
+    items = []
+    for j in jobs.list():
+        if j["status"] in _JOB_INBOX_EXPECTATIONS:
+            items.append({"kind": "job", "project": j["project"], "id": j["id"],
+                         "title": j["title"], "status": j["status"],
+                         "expected": _JOB_INBOX_EXPECTATIONS[j["status"]]})
+    for r in rooms.list():
+        if r["status"] in _ROOM_INBOX_EXPECTATIONS:
+            items.append({"kind": "planning_room", "project": r["project"], "id": r["id"],
+                         "title": r["chris_idea"][:80], "status": r["status"],
+                         "expected": _ROOM_INBOX_EXPECTATIONS[r["status"]]})
+    items.sort(key=lambda it: (it["project"], it["status"]))
+    return items
+
+
+# ── "Continue Project" prompt: Claude-Code-flavored resume, not a planning chat ─
+def build_continue_project_prompt(pid, projects, jobs, reports, rooms):
+    """Distinct from Start New Chat Packet (aimed at ChatGPT/Claude planning
+    conversations): this one is aimed squarely at Claude Code, to resume
+    unfinished execution after days/weeks away."""
+    project = get_project(projects, pid)
+    proj_jobs = jobs.list(project=pid)
+    latest_job = proj_jobs[0] if proj_jobs else None
+    latest_report = next(iter(reports.list(project=pid)), None)
+    rails = "\n".join(f"- {r}" for r in SAFETY_RAILS)
+    state = _read_project_file(pid, "PROJECT_STATE.md", "(not generated yet)")
+    job_block = (f"CURRENT JOB: {latest_job['title']} (status: {latest_job['status']})\n"
+                f"{latest_job['description']}" if latest_job
+                else "No open job — check PROJECT_STATE.md's Next Action.")
+    report_block = latest_report["raw"] if latest_report else "(no prior report)"
+    return f"""Use Claude Code. Continue work on {project['name']} from where the last
+session left off — do not restart from scratch.
+
+REPO PATH: {project.get('repo_path') or '(not set)'}
+
+PROJECT STATE:
+{state}
+
+{job_block}
+
+LAST CLAUDE REPORT:
+{report_block}
+
+SAFETY RAILS (non-negotiable)
+{rails}
+
+Re-read the project state above before making any changes. Resume from here.
+Reply using the same final status format as before when you're done."""
+
+
 # ── founder report (pure data + markdown; this module never shells out) ───────
-def build_founder_report_data(projects, jobs, reports, decisions, risks, studio_state):
+def build_founder_report_data(projects, jobs, reports, decisions, risks, studio_state, rooms=None):
     active_pid = studio_state.get("active_project")
     active_folder = project_dir(active_pid) if active_pid else None
     return {
+        "inbox": build_ai_inbox(projects, jobs, rooms) if rooms is not None else [],
         "active_project": projects.get(active_pid) if active_pid else None,
         "active_project_folder": active_folder,
         "project_state": (_read_project_file(active_pid, "PROJECT_STATE.md", "(not generated yet)")
@@ -1305,6 +1506,9 @@ def render_founder_report_markdown(data):
     lines += [data["project_state"] or "(no active project set)", ""]
     lines += ["## Active Jobs"]
     lines += [f"- [{j['status']}] {j['title']} ({j['project']})" for j in data["active_jobs"]] or ["(none)"]
+    lines += ["", "## AI Inbox"]
+    lines += [f"- [{it['kind']}] {it['project']}: {it['title']} ({it['status']}) — {it['expected']}"
+             for it in data["inbox"]] or ["(nothing waiting on an AI exchange)"]
     lines += ["", "## Needs Chris Approval"]
     lines += [f"- {it['project']}: {it['reason']}" for it in data["needs_chris"]] or ["(nothing needs Chris right now)"]
     lines += ["", "## Latest ChatGPT Plan"]
@@ -1351,9 +1555,9 @@ def render_risks_markdown(data):
     return "\n".join(lines)
 
 
-def write_all_reports(projects, jobs, reports, decisions, risks, studio_state):
+def write_all_reports(projects, jobs, reports, decisions, risks, studio_state, rooms=None):
     os.makedirs(REPORTS_DIR, exist_ok=True)
-    data = build_founder_report_data(projects, jobs, reports, decisions, risks, studio_state)
+    data = build_founder_report_data(projects, jobs, reports, decisions, risks, studio_state, rooms)
     files = {
         "FOUNDER_REPORT.md": render_founder_report_markdown(data),
         "CURRENT_STATUS.md": render_current_status_markdown(data),
@@ -1471,10 +1675,29 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/founder-report":
                 studio_state = load_studio_state()
                 data = build_founder_report_data(self.projects, self.jobs, self.reports,
-                                                 self.decisions, self.risks, studio_state)
+                                                 self.decisions, self.risks, studio_state,
+                                                 self.rooms)
                 return self._send(200, data)
             if path == "/api/needs-chris":
                 return self._send(200, {"items": needs_chris_items(self.jobs, self.reports)})
+            if path == "/api/search":
+                results = search_studio(qs.get("q", ""), self.projects, self.jobs, self.reports,
+                                        self.decisions, self.risks, self.notes, self.rooms,
+                                        project=qs.get("project"))
+                return self._send(200, results)
+            if path == "/api/inbox":
+                return self._send(200, {"items": build_ai_inbox(self.projects, self.jobs, self.rooms)})
+            m = re.match(rf"^/api/project/({_PID_RE})/timeline$", path)
+            if m:
+                get_project(self.projects, m.group(1))
+                events = build_timeline(m.group(1), self.jobs, self.reports, self.decisions,
+                                        self.risks, self.rooms, self.notes)
+                return self._send(200, {"events": events})
+            m = re.match(rf"^/api/project/({_PID_RE})/continue-prompt$", path)
+            if m:
+                text = build_continue_project_prompt(m.group(1), self.projects, self.jobs,
+                                                     self.reports, self.rooms)
+                return self._send(200, {"text": text})
             if path == "/api/notes":
                 notes = self.notes.list(project=qs.get("project"), job_id=qs.get("job"),
                                         note_type=qs.get("type"))
@@ -1544,6 +1767,11 @@ class Handler(BaseHTTPRequestHandler):
             m = re.match(rf"^/api/jobs/({_UUID_RE})/delete$", path)
             if m:
                 job = self.jobs.delete(m.group(1))
+                return self._send(200, self._with_next(job))
+            m = re.match(rf"^/api/jobs/({_UUID_RE})/reject$", path)
+            if m:
+                job = self.jobs.reject(m.group(1), self._body().get("reason", ""))
+                self._sync(job["project"])
                 return self._send(200, self._with_next(job))
             m = re.match(rf"^/api/jobs/({_UUID_RE})/generate-chatgpt-prompt$", path)
             if m:
@@ -1744,7 +1972,7 @@ def main():
     if "--founder-report" in sys.argv:
         projects, jobs, reports, decisions, risks, notes, rooms = build_app_state()
         studio_state = load_studio_state()
-        files = write_all_reports(projects, jobs, reports, decisions, risks, studio_state)
+        files = write_all_reports(projects, jobs, reports, decisions, risks, studio_state, rooms)
         for name in files:
             print(f"wrote reports/{name}")
         return

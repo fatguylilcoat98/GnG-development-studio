@@ -21,6 +21,14 @@ Completed → Archived
   surface *mid-build*, not only after the formal Testing gate. A job stuck at
   `Building` does not have to fake its way through `Testing` just to reach
   Chris.
+- **Needs Chris Approval can send a job back to Building.** `POST
+  /api/jobs/<id>/reject {reason}` is the one deliberate exception to
+  forward-only progression — the actionable Needs Chris queue's "Send back
+  for more work" button. Legal only from `Needs Chris Approval`, and logged
+  distinctly (`rejected: true` + the reason) in the job's history so it's
+  never mistaken for ordinary forward movement, exactly like
+  `PlanningRoomStore.emergency_skip`. A rejected job can walk forward again
+  through `Testing → Needs Chris Approval` as many times as it takes.
 - **Archived is terminal.** Nothing moves out of it.
 - **Completed can archive.** `Completed → Archived` is the only step after
   `Completed`.
