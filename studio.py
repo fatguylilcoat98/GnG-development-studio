@@ -31,6 +31,7 @@ from urllib.parse import urlparse, parse_qs
 ROOT = os.path.dirname(os.path.abspath(__file__))
 STATE_DIR = os.path.join(ROOT, "state")
 REPORTS_DIR = os.path.join(ROOT, "reports")
+PROJECTS_DIR = os.path.join(ROOT, "projects")
 DASHBOARD_PATH = os.path.join(ROOT, "dashboard.html")
 
 PROJECTS_PATH = os.path.join(STATE_DIR, "projects.json")
@@ -60,6 +61,24 @@ PLANNING_STATUSES = ["Idea", "ChatGPT Reviewed", "Claude Reviewed", "Council Nee
 
 NOTE_TYPES = ("chatgpt_plan", "chatgpt_plan_response", "claude_code_prompt",
              "architecture_note", "next_steps")
+
+# PROJECT_STATE.md's canonical section headings, in order. This file is the
+# per-project persistent memory Chris (or a fresh ChatGPT/Claude chat) can
+# read cold — see docs/PROJECT_MODEL.md.
+PROJECT_STATE_HEADINGS = [
+    "Mission", "Current Status", "Current Goal", "Current Sprint",
+    "Current Architecture", "Completed Work", "In Progress", "Blocked",
+    "Open Questions", "Latest ChatGPT Plan", "Latest Claude Report",
+    "Latest Council Notes", "Active PRs", "Risks", "Needs Chris",
+    "Next Action", "Last Updated",
+]
+
+STUDIO_WHO_IS_CHRIS = (
+    "Chris is the founder/operator directing every GNG project. He works "
+    "through GNG Development Studio to coordinate ChatGPT (planning), Claude "
+    "(independent critique), and Claude Code (execution) without being the "
+    "manual middleman between them."
+)
 
 SAFETY_RAILS = [
     "Do not touch unrelated projects.",
@@ -275,9 +294,139 @@ class IllegalTransition(ValueError):
     pass
 
 
+# ── project folders: persistent, file-based per-project memory ────────────────
+# projects/<slug>/ is durable, version-controlled memory — the thing Chris opens
+# to reconstruct context instead of scrolling a long chat. It is deliberately
+# NOT gitignored (unlike state/, which is a runtime ledger): these files are
+# meant to be read, browsed, and hand-edited over time.
+def project_dir(pid):
+    return os.path.join(PROJECTS_DIR, pid)
+
+
+def _write_if_absent(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if not os.path.exists(path):
+        with open(path, "w") as f:
+            f.write(content)
+
+
+def _read_project_file(pid, rel, default=""):
+    path = os.path.join(project_dir(pid), rel)
+    if os.path.exists(path):
+        with open(path) as f:
+            content = f.read().strip()
+        return content or default
+    return default
+
+
+def _write_project_file(pid, rel, content):
+    path = os.path.join(project_dir(pid), rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(content.rstrip("\n") + "\n")
+
+
+def _append_project_file(pid, rel, entry_text):
+    path = os.path.join(project_dir(pid), rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as f:
+        f.write(f"\n## {_now()}\n{entry_text.strip()}\n")
+
+
+def _history_filename(suffix=""):
+    stamp = _now().replace(":", "-")
+    tag = f"_{suffix}" if suffix else ""
+    return f"{stamp}{tag}_{_id()[:8]}.md"
+
+
+def _write_current_and_history(pid, subdir, current_name, content, history_suffix=""):
+    """Overwrite subdir/<current_name> with content and ALSO archive a
+    timestamped copy into subdir/History/ — 'current' always reflects the
+    latest; nothing that was ever pasted in is lost."""
+    d = os.path.join(project_dir(pid), subdir)
+    hist = os.path.join(d, "History")
+    os.makedirs(hist, exist_ok=True)
+    with open(os.path.join(d, current_name), "w") as f:
+        f.write(content.rstrip("\n") + "\n")
+    with open(os.path.join(hist, _history_filename(history_suffix)), "w") as f:
+        f.write(content.rstrip("\n") + "\n")
+
+
+def save_chatgpt_plan_to_folder(pid, content):
+    _write_current_and_history(pid, "CHATGPT", "Current_Plan.md", content)
+
+
+def save_claude_report_to_folder(pid, content):
+    _write_current_and_history(pid, "CLAUDE", "Current_Report.md", content)
+
+
+def save_council_note_to_folder(pid, author, content):
+    stamped = f"## {_now()} — {author or 'council'}\n\n{content.strip()}\n"
+    _write_current_and_history(pid, "COUNCIL", "Latest.md", stamped, history_suffix=author or "council")
+
+
+def append_decision_to_folder(pid, text):
+    _append_project_file(pid, "DECISIONS.md", text)
+
+
+def append_risk_to_folder(pid, text):
+    _append_project_file(pid, "RISKS.md", text)
+
+
+def write_next_action_to_folder(pid, text):
+    _write_project_file(pid, "NEXT_ACTION.md", text or "")
+
+
+def ensure_project_folder(pid, project):
+    """Idempotent: creates any missing directory/file for one project without
+    ever clobbering existing (possibly hand-edited) content. PROJECT_STATE.md
+    is the one exception — it is Studio-regenerated (see sync_project_state)
+    and only seeded here with a skeleton if entirely absent."""
+    d = project_dir(pid)
+    for sub in ("CHATGPT/History", "CLAUDE/History", "COUNCIL/History",
+               "REPORTS", "PRS", "SCREENSHOTS", "FILES"):
+        os.makedirs(os.path.join(d, sub), exist_ok=True)
+        # git tracks no empty directories — a .gitkeep makes the required
+        # subfolder structure actually persist once committed.
+        _write_if_absent(os.path.join(d, sub, ".gitkeep"), "")
+    _write_if_absent(os.path.join(d, "MISSION.md"),
+                     f"# Mission — {project['name']}\n\n{project.get('notes', '')}\n")
+    _write_if_absent(os.path.join(d, "ARCHITECTURE.md"),
+                     f"# Architecture — {project['name']}\n\n(not yet documented)\n")
+    _write_if_absent(os.path.join(d, "DECISIONS.md"), f"# Decisions — {project['name']}\n")
+    _write_if_absent(os.path.join(d, "RISKS.md"), f"# Risks — {project['name']}\n")
+    _write_if_absent(os.path.join(d, "ROADMAP.md"),
+                     f"# Roadmap — {project['name']}\n\n(not yet documented)\n")
+    _write_if_absent(os.path.join(d, "NEXT_ACTION.md"), (project.get("next_action") or "") + "\n")
+    _write_if_absent(os.path.join(d, "CHATGPT", "Current_Plan.md"), "(no plan yet)\n")
+    _write_if_absent(os.path.join(d, "CLAUDE", "Current_Report.md"), "(no report yet)\n")
+    _write_if_absent(os.path.join(d, "COUNCIL", "Latest.md"), "(no council notes yet)\n")
+    state_path = os.path.join(d, "PROJECT_STATE.md")
+    if not os.path.exists(state_path):
+        skeleton = "\n\n".join([f"# {project['name']}"] +
+                               [f"## {h}\n" for h in PROJECT_STATE_HEADINGS])
+        with open(state_path, "w") as f:
+            f.write(skeleton + "\n")
+
+
+def ensure_all_project_folders(projects):
+    for pid, project in projects.items():
+        ensure_project_folder(pid, project)
+
+
+def _require_known_project(projects, pid):
+    """Hard rule: no job, note, risk, decision, report, or planning room may be
+    orphaned. Every one of them must be attached to exactly one REGISTERED
+    project id — never empty, never unknown."""
+    if not pid or pid not in projects:
+        raise ValueError(f"unknown or missing project: {pid!r} — every record must "
+                         f"be attached to exactly one registered project")
+
+
 # ── jobs ────────────────────────────────────────────────────────────────────────
 class JobStore:
-    def __init__(self):
+    def __init__(self, projects):
+        self.projects = projects
         self.jobs = {}
         self.load()
 
@@ -306,6 +455,7 @@ class JobStore:
 
     def create(self, project, title, description, priority="normal", constraints="",
               approval_required=True, safety_notes=""):
+        _require_known_project(self.projects, project)
         title, description = str(title).strip(), str(description).strip()
         if not title:
             raise ValueError("title is required")
@@ -490,7 +640,8 @@ def parse_claude_report(raw):
 
 
 class ReportStore:
-    def __init__(self):
+    def __init__(self, projects):
+        self.projects = projects
         self.reports = {}
         self.load()
 
@@ -506,6 +657,7 @@ class ReportStore:
         return sorted(vals, key=lambda r: r["created_at"], reverse=True)
 
     def ingest(self, job_id, project, raw, manual=None):
+        _require_known_project(self.projects, project)
         raw = str(raw or "")
         fields, parsed_ok = parse_claude_report(raw)
         if manual:
@@ -514,12 +666,14 @@ class ReportStore:
               "parsed_ok": parsed_ok, "created_at": time.time(), **fields}
         self.reports[rec["id"]] = rec
         _jsonl_append(REPORTS_PATH, rec)
+        save_claude_report_to_folder(project, raw)
         return rec
 
 
 # ── decisions / risks / notes ───────────────────────────────────────────────────
 class DecisionStore:
-    def __init__(self):
+    def __init__(self, projects):
+        self.projects = projects
         self.decisions = {}
         self.load()
 
@@ -533,6 +687,7 @@ class DecisionStore:
         return sorted(vals, key=lambda d: d["created_at"], reverse=True)
 
     def create(self, project, text, job_id=None, source="manual"):
+        _require_known_project(self.projects, project)
         text = str(text).strip()
         if not text:
             raise ValueError("decision text is required")
@@ -540,11 +695,13 @@ class DecisionStore:
               "source": source, "created_at": time.time()}
         self.decisions[rec["id"]] = rec
         _jsonl_append(DECISIONS_PATH, rec)
+        append_decision_to_folder(project, text)
         return rec
 
 
 class RiskStore:
-    def __init__(self):
+    def __init__(self, projects):
+        self.projects = projects
         self.risks = {}
         self.load()
 
@@ -560,6 +717,7 @@ class RiskStore:
         return sorted(vals, key=lambda r: r["created_at"], reverse=True)
 
     def create(self, project, description, severity="normal", job_id=None, source="manual"):
+        _require_known_project(self.projects, project)
         description = str(description).strip()
         if not description:
             raise ValueError("risk description is required")
@@ -568,6 +726,7 @@ class RiskStore:
               "created_at": time.time(), "updated_at": time.time()}
         self.risks[rec["id"]] = rec
         _jsonl_append(RISKS_PATH, rec)
+        append_risk_to_folder(project, description)
         return rec
 
     def resolve(self, rid):
@@ -581,7 +740,8 @@ class RiskStore:
 
 
 class NoteStore:
-    def __init__(self):
+    def __init__(self, projects):
+        self.projects = projects
         self.notes = {}
         self.load()
 
@@ -600,6 +760,7 @@ class NoteStore:
 
     def create(self, project, note_type, content="", job_id=None, pinned=False,
               author="operator", **extra):
+        _require_known_project(self.projects, project)
         if note_type not in NOTE_TYPES:
             raise ValueError(f"note_type must be one of {NOTE_TYPES}")
         rec = {"id": _id(), "project": project, "job_id": job_id, "note_type": note_type,
@@ -622,7 +783,8 @@ class NoteStore:
 
 # ── planning room ────────────────────────────────────────────────────────────────
 class PlanningRoomStore:
-    def __init__(self, jobs, notes):
+    def __init__(self, projects, jobs, notes):
+        self.projects = projects
         self.rooms = {}
         self.jobs = jobs
         self.notes = notes
@@ -651,6 +813,7 @@ class PlanningRoomStore:
         return sorted(vals, key=lambda r: r["created_at"], reverse=True)
 
     def create(self, project, chris_idea):
+        _require_known_project(self.projects, project)
         chris_idea = str(chris_idea).strip()
         if not chris_idea:
             raise ValueError("Chris's original idea is required")
@@ -695,6 +858,7 @@ class PlanningRoomStore:
         room = self._get(rid)
         room = dict(room, chatgpt_response=str(text), updated_at=time.time())
         self._save(room)
+        save_chatgpt_plan_to_folder(room["project"], str(text))
         if room["status"] == "Idea":
             room = self._advance(rid, "ChatGPT Reviewed")
         return room
@@ -703,6 +867,7 @@ class PlanningRoomStore:
         room = self._get(rid)
         room = dict(room, claude_response=str(text), updated_at=time.time())
         self._save(room)
+        save_claude_report_to_folder(room["project"], str(text))
         if room["status"] == "ChatGPT Reviewed":
             room = self._advance(rid, "Claude Reviewed")
         return room
@@ -713,6 +878,7 @@ class PlanningRoomStore:
         room = dict(room, council_responses=room["council_responses"] + [entry],
                    updated_at=time.time())
         self._save(room)
+        save_council_note_to_folder(room["project"], author, str(text))
         if room["status"] == "Claude Reviewed":
             room = self._advance(rid, "Council Needed")
         return room
@@ -914,37 +1080,51 @@ def build_project_memory(pid, projects, jobs, reports, decisions, risks, notes):
 
 
 def build_where_are_we(pid, projects, jobs, reports, decisions, rooms):
+    """Generated from the project's FOLDER FILES (not only JSONL) — see
+    docs/PROJECT_MODEL.md. Reading real files means this survives a restart:
+    even a freshly-loaded set of stores can reproduce it from disk alone."""
     project = get_project(projects, pid)
     proj_jobs = jobs.list(project=pid)
     latest_job = proj_jobs[0] if proj_jobs else None
+    chatgpt_plan = _read_project_file(pid, os.path.join("CHATGPT", "Current_Plan.md"), "(nothing yet)")
+    decisions_log = _read_project_file(pid, "DECISIONS.md", "(no decisions logged yet)")
+    needs = [it["reason"] for it in needs_chris_items(jobs, reports) if it["project"] == pid]
+    next_action = _read_project_file(pid, "NEXT_ACTION.md", project.get("next_action", ""))
     proj_rooms = rooms.list(project=pid)
     latest_room = proj_rooms[0] if proj_rooms else None
-    latest_decision = next(iter(decisions.list(project=pid)), None)
     council_needed = bool(latest_room and latest_room["status"] == "Council Needed")
     return f"""WHERE ARE WE — {project['name']}
 
+Project: {project['name']} ({project['id']})
+Mission: {project.get('notes', '')}
+Current status: {project.get('status', '')}
 Current goal: {project.get('current_goal') or '(not set)'}
-Last decided: {latest_decision['text'] if latest_decision else '(no decisions logged yet)'}
-What ChatGPT said: {(latest_room['chatgpt_response'][:400] + '...') if latest_room and latest_room['chatgpt_response'] else '(nothing yet)'}
-What Claude said: {(latest_room['claude_response'][:400] + '...') if latest_room and latest_room['claude_response'] else '(nothing yet)'}
+Latest decisions:
+{decisions_log}
+Latest ChatGPT plan: {chatgpt_plan}
+Latest Claude report: {_read_project_file(pid, os.path.join('CLAUDE', 'Current_Report.md'), '(nothing yet)')}
+Risks: {_read_project_file(pid, "RISKS.md", "(none logged)")}
+Blockers: {latest_job['status'] if latest_job else '(no jobs yet)'}
 Council needed: {'yes' if council_needed else 'no'}
-Next build step: {latest_job['status'] if latest_job else '(no jobs yet)'}
-What needs Chris: {project.get('next_action') or '(nothing recorded)'}"""
+Needs Chris: {'; '.join(needs) if needs else '(nothing right now)'}
+Next action: {next_action or '(nothing recorded)'}"""
 
 
 def build_continuity_packet(pid, projects, jobs, reports, decisions, risks, rooms):
+    """Generated from the project's folder files (PROJECT_STATE.md, DECISIONS.md,
+    RISKS.md, CHATGPT/Current_Plan.md, CLAUDE/Current_Report.md), not only JSONL."""
     project = get_project(projects, pid)
     proj_rooms = rooms.list(project=pid)
     latest_room = proj_rooms[0] if proj_rooms else None
     proj_jobs = jobs.list(project=pid)
     latest_job = proj_jobs[0] if proj_jobs else None
-    latest_report = next(iter(reports.list(project=pid)), None)
-    open_risks = risks.list(project=pid, resolved=False)
-    recent_decisions = decisions.list(project=pid)[:5]
     current_plan = (latest_room["unified_plan"] if latest_room and latest_room["unified_plan"]
                     else (latest_job["description"] if latest_job else "(no plan yet)"))
-    risk_lines = "\n".join(f"- {r['description']}" for r in open_risks) or "(none open)"
-    decision_lines = "\n".join(f"- {d['text']}" for d in recent_decisions) or "(none logged)"
+    decision_lines = _read_project_file(pid, "DECISIONS.md", "(none logged)")
+    risk_lines = _read_project_file(pid, "RISKS.md", "(none open)")
+    latest_claude_report = _read_project_file(pid, os.path.join("CLAUDE", "Current_Report.md"),
+                                              "(no reports yet)")
+    next_action = _read_project_file(pid, "NEXT_ACTION.md", project.get("next_action", ""))
     return f"""PROJECT CONTINUITY PACKET — {project['name']}
 (Paste this at the top of a new ChatGPT or Claude chat to restore context.)
 
@@ -960,17 +1140,137 @@ CURRENT PLAN:
 OPEN RISKS:
 {risk_lines}
 
-NEXT ACTION: {project.get('next_action', '')}
+NEXT ACTION: {next_action}
 
 LATEST CLAUDE CODE REPORT:
-{latest_report['raw'] if latest_report else '(no reports yet)'}"""
+{latest_claude_report}"""
+
+
+def build_start_new_chat_packet(pid, projects, jobs, reports, decisions, risks, rooms):
+    """The stronger continuity packet: who Chris is, what the project is,
+    current state, architecture, completed/active work, decisions, current
+    disagreement/risks, what each AI should do next, and what NOT to work on.
+    Also folder-file-sourced, for the same restart-survival reason."""
+    project = get_project(projects, pid)
+    architecture = _read_project_file(pid, "ARCHITECTURE.md", "(not yet documented)")
+    proj_jobs = jobs.list(project=pid)
+    completed = [j for j in proj_jobs if j["status"] in ("Completed", "Archived")]
+    active = [j for j in proj_jobs
+             if j["status"] not in ("Completed", "Archived", "Needs Chris Approval")]
+    decisions_log = _read_project_file(pid, "DECISIONS.md", "(none logged)")
+    risks_log = _read_project_file(pid, "RISKS.md", "(none logged)")
+    proj_rooms = rooms.list(project=pid)
+    latest_room = proj_rooms[0] if proj_rooms else None
+    disagreement = (latest_room.get("disagreements") if latest_room else "") or "(none recorded)"
+    next_action = _read_project_file(pid, "NEXT_ACTION.md", project.get("next_action", ""))
+    other_hands_off = sorted(p["name"] for p in projects.values()
+                             if p.get("hands_off") and p["id"] != pid)
+    not_to_work_on = ((f"Do not touch: {', '.join(other_hands_off)}. " if other_hands_off else "")
+                      + f"Stay scoped to {project['name']}'s own repo "
+                      f"({project.get('repo_path') or 'not set'}); do not deploy, restart "
+                      f"services, or enable live mode.")
+    completed_lines = "\n".join(f"- {j['title']}" for j in completed) or "(none yet)"
+    active_lines = "\n".join(f"- [{j['status']}] {j['title']}" for j in active) or "(none)"
+    return f"""START NEW CHAT PACKET — {project['name']}
+(Paste this at the very top of a brand-new ChatGPT or Claude chat.)
+
+WHO CHRIS IS: {STUDIO_WHO_IS_CHRIS}
+
+WHAT THE PROJECT IS: {project.get('notes', '')}
+
+CURRENT STATE: {project.get('status', '')} — {project.get('current_goal') or 'no current goal set'}
+
+ARCHITECTURE:
+{architecture}
+
+COMPLETED WORK:
+{completed_lines}
+
+ACTIVE WORK:
+{active_lines}
+
+IMPORTANT DECISIONS:
+{decisions_log}
+
+CURRENT DISAGREEMENT / RISKS:
+{disagreement}
+{risks_log}
+
+WHAT CHATGPT SHOULD DO NEXT: {next_action or '(not set)'}
+WHAT CLAUDE SHOULD DO NEXT: {next_action or '(not set)'}
+
+WHAT NOT TO WORK ON: {not_to_work_on}"""
+
+
+def render_project_state_markdown(pid, projects, jobs, reports, decisions, risks, rooms):
+    """Regenerates PROJECT_STATE.md's full content — the canonical, always-fresh
+    per-project memory file. Pure/deterministic given current state; call
+    sync_project_state() to also write it to disk."""
+    project = get_project(projects, pid)
+    proj_jobs = jobs.list(project=pid)
+    completed = [j for j in proj_jobs if j["status"] in ("Completed", "Archived")]
+    blocked = [j for j in proj_jobs if j["status"] == "Needs Chris Approval"]
+    active = [j for j in proj_jobs if j not in completed and j not in blocked]
+    open_risks = risks.list(project=pid, resolved=False)
+    needs = [it["reason"] for it in needs_chris_items(jobs, reports) if it["project"] == pid]
+    proj_rooms = rooms.list(project=pid)
+    latest_room = proj_rooms[0] if proj_rooms else None
+    chatgpt_plan = _read_project_file(pid, os.path.join("CHATGPT", "Current_Plan.md"), "(none yet)")
+    claude_report = _read_project_file(pid, os.path.join("CLAUDE", "Current_Report.md"), "(none yet)")
+    council_notes = _read_project_file(pid, os.path.join("COUNCIL", "Latest.md"), "(none yet)")
+    next_action = _read_project_file(pid, "NEXT_ACTION.md", project.get("next_action", ""))
+    open_questions = (latest_room.get("disagreements") if latest_room else "") or "(none recorded)"
+
+    lines = [f"# {project['name']}", "",
+            "## Mission", project.get("notes", ""), "",
+            "## Current Status", project.get("status", ""), "",
+            "## Current Goal", project.get("current_goal") or "(not set)", "",
+            "## Current Sprint", "(not tracked yet)", "",
+            "## Current Architecture", "(see ARCHITECTURE.md)", "",
+            "## Completed Work"]
+    lines += [f"- {j['title']}" for j in completed] or ["(none yet)"]
+    lines += ["", "## In Progress"]
+    lines += [f"- [{j['status']}] {j['title']}" for j in active] or ["(none)"]
+    lines += ["", "## Blocked"]
+    lines += [f"- {j['title']}" for j in blocked] or ["(none)"]
+    lines += ["", "## Open Questions", open_questions, "",
+             "## Latest ChatGPT Plan", chatgpt_plan, "",
+             "## Latest Claude Report", claude_report, "",
+             "## Latest Council Notes", council_notes, "",
+             "## Active PRs", project.get("open_pr") or "(none)", "",
+             "## Risks"]
+    lines += [f"- {r['description']}" for r in open_risks] or ["(none open)"]
+    lines += ["", "## Needs Chris"]
+    lines += [f"- {r}" for r in needs] or ["(nothing right now)"]
+    lines += ["", "## Next Action", next_action or "(not set)", "",
+             "## Last Updated", _now()]
+    return "\n".join(lines)
+
+
+def sync_project_state(pid, projects, jobs, reports, decisions, risks, rooms):
+    """Regenerate and write PROJECT_STATE.md for one project. Called after any
+    mutation that could change the picture (job status, a new plan/report/
+    council note, a decision, a risk, a next-action update)."""
+    content = render_project_state_markdown(pid, projects, jobs, reports, decisions, risks, rooms)
+    _write_project_file(pid, "PROJECT_STATE.md", content)
+    return content
 
 
 # ── founder report (pure data + markdown; this module never shells out) ───────
 def build_founder_report_data(projects, jobs, reports, decisions, risks, studio_state):
     active_pid = studio_state.get("active_project")
+    active_folder = project_dir(active_pid) if active_pid else None
     return {
         "active_project": projects.get(active_pid) if active_pid else None,
+        "active_project_folder": active_folder,
+        "project_state": (_read_project_file(active_pid, "PROJECT_STATE.md", "(not generated yet)")
+                          if active_pid else None),
+        "latest_chatgpt_plan_file": (_read_project_file(active_pid, os.path.join("CHATGPT", "Current_Plan.md"), "(none yet)")
+                                     if active_pid else None),
+        "latest_claude_report_file": (_read_project_file(active_pid, os.path.join("CLAUDE", "Current_Report.md"), "(none yet)")
+                                      if active_pid else None),
+        "latest_council_notes_file": (_read_project_file(active_pid, os.path.join("COUNCIL", "Latest.md"), "(none yet)")
+                                      if active_pid else None),
         "active_jobs": [j for j in jobs.list() if j["status"] not in ("Completed", "Archived")],
         "needs_chris": needs_chris_items(jobs, reports),
         "latest_reports": reports.list()[:5],
@@ -998,12 +1298,21 @@ def render_founder_report_markdown(data):
     lines += ["## Active Project",
              (f"**{data['active_project']['name']}**" if data["active_project"]
               else "(no active project set)"), ""]
+    lines += ["## Active Project Folder",
+             f"`{data['active_project_folder']}`" if data["active_project_folder"]
+             else "(no active project set)", ""]
+    lines += ["## Current Project State"]
+    lines += [data["project_state"] or "(no active project set)", ""]
     lines += ["## Active Jobs"]
     lines += [f"- [{j['status']}] {j['title']} ({j['project']})" for j in data["active_jobs"]] or ["(none)"]
     lines += ["", "## Needs Chris Approval"]
     lines += [f"- {it['project']}: {it['reason']}" for it in data["needs_chris"]] or ["(nothing needs Chris right now)"]
+    lines += ["", "## Latest ChatGPT Plan"]
+    lines += [data["latest_chatgpt_plan_file"] or "(no active project set)"]
     lines += ["", "## Latest Claude Report"]
-    lines += [data["latest_reports"][0]["raw"] if data["latest_reports"] else "(none yet)"]
+    lines += [data["latest_claude_report_file"] or (data["latest_reports"][0]["raw"] if data["latest_reports"] else "(none yet)")]
+    lines += ["", "## Latest Council Notes"]
+    lines += [data["latest_council_notes_file"] or "(no active project set)"]
     lines += ["", "## Latest Decisions"]
     lines += [f"- {d['project']}: {d['text']}" for d in data["latest_decisions"]] or ["(none logged)"]
     lines += ["", "## Open Risks"]
@@ -1100,6 +1409,11 @@ class Handler(BaseHTTPRequestHandler):
         return dict(room, allowed_next=PlanningRoomStore.allowed_next(room),
                    can_generate_build_prompt=PlanningRoomStore.can_generate_build_prompt(room))
 
+    def _sync(self, pid):
+        """Regenerate PROJECT_STATE.md for one project after a mutation."""
+        sync_project_state(pid, self.projects, self.jobs, self.reports,
+                           self.decisions, self.risks, self.rooms)
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path, qs = parsed.path, {k: v[0] for k, v in parse_qs(parsed.query).items()}
@@ -1134,6 +1448,26 @@ class Handler(BaseHTTPRequestHandler):
                 text = build_continuity_packet(m.group(1), self.projects, self.jobs, self.reports,
                                                self.decisions, self.risks, self.rooms)
                 return self._send(200, {"text": text})
+            m = re.match(rf"^/api/project/({_PID_RE})/start-new-chat-packet$", path)
+            if m:
+                text = build_start_new_chat_packet(m.group(1), self.projects, self.jobs,
+                                                   self.reports, self.decisions, self.risks,
+                                                   self.rooms)
+                return self._send(200, {"text": text})
+            m = re.match(rf"^/api/project/({_PID_RE})/state$", path)
+            if m:
+                get_project(self.projects, m.group(1))
+                content = _read_project_file(m.group(1), "PROJECT_STATE.md", "(not generated yet)")
+                return self._send(200, {"content": content})
+            m = re.match(rf"^/api/project/({_PID_RE})/file$", path)
+            if m:
+                get_project(self.projects, m.group(1))
+                name = qs.get("name", "")
+                if name not in ("MISSION.md", "ARCHITECTURE.md", "ROADMAP.md", "DECISIONS.md",
+                                "RISKS.md", "NEXT_ACTION.md", "PROJECT_STATE.md"):
+                    return self._send(400, {"error": f"unknown or unreadable file: {name}"})
+                content = _read_project_file(m.group(1), name, "")
+                return self._send(200, {"name": name, "content": content})
             if path == "/api/founder-report":
                 studio_state = load_studio_state()
                 data = build_founder_report_data(self.projects, self.jobs, self.reports,
@@ -1200,10 +1534,12 @@ class Handler(BaseHTTPRequestHandler):
                                        constraints=b.get("constraints", ""),
                                        approval_required=bool(b.get("approval_required", True)),
                                        safety_notes=b.get("safety_notes", ""))
+                self._sync(job["project"])
                 return self._send(201, self._with_next(job))
             m = re.match(rf"^/api/jobs/({_UUID_RE})/status$", path)
             if m:
                 job = self.jobs.advance(m.group(1), str(self._body().get("status", "")))
+                self._sync(job["project"])
                 return self._send(200, self._with_next(job))
             m = re.match(rf"^/api/jobs/({_UUID_RE})/delete$", path)
             if m:
@@ -1217,6 +1553,7 @@ class Handler(BaseHTTPRequestHandler):
                 prompt = build_chatgpt_planning_prompt(job, project)
                 self.notes.create(project=job["project"], job_id=jid,
                                   note_type="chatgpt_plan", content=prompt)
+                self._sync(job["project"])
                 return self._send(200, {"job": self._with_next(job), "prompt": prompt})
             m = re.match(rf"^/api/jobs/({_UUID_RE})/generate-claude-prompt$", path)
             if m:
@@ -1226,6 +1563,7 @@ class Handler(BaseHTTPRequestHandler):
                 prompt = build_claude_code_build_prompt(job, project)
                 self.notes.create(project=job["project"], job_id=jid,
                                   note_type="claude_code_prompt", content=prompt)
+                self._sync(job["project"])
                 return self._send(200, {"job": self._with_next(job), "prompt": prompt})
             m = re.match(rf"^/api/jobs/({_UUID_RE})/chatgpt-plan$", path)
             if m:
@@ -1239,12 +1577,18 @@ class Handler(BaseHTTPRequestHandler):
                                          recommended_prompt=b.get("recommended_prompt", ""),
                                          risks=b.get("risks", ""), decisions=b.get("decisions", ""),
                                          next_step=b.get("next_step", ""))
+                formatted = (f"## ChatGPT Plan Response\n\nSummary: {b.get('plan_summary', '')}\n\n"
+                            f"Recommended prompt: {b.get('recommended_prompt', '')}\n\n"
+                            f"Risks: {b.get('risks', '')}\n\nDecisions: {b.get('decisions', '')}\n\n"
+                            f"Next step: {b.get('next_step', '')}")
+                save_chatgpt_plan_to_folder(job["project"], formatted)
                 if b.get("risks"):
                     self.risks.create(job["project"], b["risks"], job_id=jid,
                                       source="chatgpt_plan_ingestion")
                 if b.get("decisions"):
                     self.decisions.create(job["project"], b["decisions"], job_id=jid,
                                           source="chatgpt_plan_ingestion")
+                self._sync(job["project"])
                 return self._send(201, note)
             m = re.match(rf"^/api/jobs/({_UUID_RE})/claude-report$", path)
             if m:
@@ -1253,6 +1597,7 @@ class Handler(BaseHTTPRequestHandler):
                 b = self._body()
                 rec = self.reports.ingest(jid, job["project"], b.get("raw", ""),
                                           manual=b.get("manual"))
+                self._sync(job["project"])
                 return self._send(201, rec)
             if path == "/api/notes":
                 b = self._body()
@@ -1268,19 +1613,43 @@ class Handler(BaseHTTPRequestHandler):
                 b = self._body()
                 d = self.decisions.create(project=b.get("project", ""), text=b.get("text", ""),
                                           job_id=b.get("job_id"))
+                self._sync(d["project"])
                 return self._send(201, d)
             if path == "/api/risks":
                 b = self._body()
                 r = self.risks.create(project=b.get("project", ""),
                                       description=b.get("description", ""),
                                       severity=b.get("severity", "normal"), job_id=b.get("job_id"))
+                self._sync(r["project"])
                 return self._send(201, r)
             m = re.match(rf"^/api/risks/({_UUID_RE})/resolve$", path)
             if m:
-                return self._send(200, self.risks.resolve(m.group(1)))
+                r = self.risks.resolve(m.group(1))
+                self._sync(r["project"])
+                return self._send(200, r)
             m = re.match(rf"^/api/project/({_PID_RE})/active$", path)
             if m:
                 return self._send(200, set_active_project(m.group(1)))
+            m = re.match(rf"^/api/project/({_PID_RE})/next-action$", path)
+            if m:
+                pid = m.group(1)
+                text = str(self._body().get("text", ""))
+                update_project(self.projects, pid, next_action=text)
+                write_next_action_to_folder(pid, text)
+                self._sync(pid)
+                return self._send(200, {"project": pid, "next_action": text})
+            m = re.match(rf"^/api/project/({_PID_RE})/file$", path)
+            if m:
+                pid = m.group(1)
+                get_project(self.projects, pid)
+                b = self._body()
+                name = b.get("name", "")
+                if name not in ("MISSION.md", "ARCHITECTURE.md", "ROADMAP.md"):
+                    return self._send(400, {"error": f"{name} is not directly writable via this "
+                                                     f"endpoint (append-only or auto-generated files "
+                                                     f"have their own routes)"})
+                _write_project_file(pid, name, str(b.get("content", "")))
+                return self._send(200, {"project": pid, "name": name})
             if path == "/api/planning-rooms":
                 b = self._body()
                 room = self.rooms.create(project=b.get("project", ""),
@@ -1289,26 +1658,31 @@ class Handler(BaseHTTPRequestHandler):
             m = re.match(rf"^/api/planning-rooms/({_UUID_RE})/chatgpt-response$", path)
             if m:
                 room = self.rooms.paste_chatgpt_response(m.group(1), self._body().get("text", ""))
+                self._sync(room["project"])
                 return self._send(200, self._room_with_next(room))
             m = re.match(rf"^/api/planning-rooms/({_UUID_RE})/claude-response$", path)
             if m:
                 room = self.rooms.paste_claude_response(m.group(1), self._body().get("text", ""))
+                self._sync(room["project"])
                 return self._send(200, self._room_with_next(room))
             m = re.match(rf"^/api/planning-rooms/({_UUID_RE})/council-response$", path)
             if m:
                 b = self._body()
                 room = self.rooms.paste_council_response(m.group(1), b.get("author", ""),
                                                           b.get("text", ""))
+                self._sync(room["project"])
                 return self._send(200, self._room_with_next(room))
             m = re.match(rf"^/api/planning-rooms/({_UUID_RE})/disagreements$", path)
             if m:
                 b = self._body()
                 room = self.rooms.set_disagreements_and_risks(m.group(1), b.get("disagreements"),
                                                               b.get("risks"))
+                self._sync(room["project"])
                 return self._send(200, self._room_with_next(room))
             m = re.match(rf"^/api/planning-rooms/({_UUID_RE})/unified-plan$", path)
             if m:
                 room = self.rooms.generate_unified_plan_draft(m.group(1), self._body().get("text", ""))
+                self._sync(room["project"])
                 return self._send(200, self._room_with_next(room))
             m = re.match(rf"^/api/planning-rooms/({_UUID_RE})/needs-signoff$", path)
             if m:
@@ -1317,10 +1691,12 @@ class Handler(BaseHTTPRequestHandler):
             m = re.match(rf"^/api/planning-rooms/({_UUID_RE})/chris-approved$", path)
             if m:
                 room = self.rooms.chris_approved(m.group(1), self._body().get("note", ""))
+                self._sync(room["project"])
                 return self._send(200, self._room_with_next(room))
             m = re.match(rf"^/api/planning-rooms/({_UUID_RE})/emergency-skip$", path)
             if m:
                 room = self.rooms.emergency_skip(m.group(1), self._body().get("reason", ""))
+                self._sync(room["project"])
                 return self._send(200, self._room_with_next(room))
             m = re.match(rf"^/api/planning-rooms/({_UUID_RE})/build-prompt$", path)
             if m:
@@ -1330,6 +1706,7 @@ class Handler(BaseHTTPRequestHandler):
                 prompt = build_claude_code_build_prompt(job, project)
                 self.notes.create(project=room["project"], job_id=job["id"],
                                   note_type="claude_code_prompt", content=prompt)
+                self._sync(room["project"])
                 return self._send(200, {"job": self._with_next(job),
                                         "room": self._room_with_next(room), "prompt": prompt})
             return self._send(404, {"error": "not found"})
@@ -1345,12 +1722,13 @@ class Handler(BaseHTTPRequestHandler):
 
 def build_app_state():
     projects = load_projects()
-    jobs = JobStore()
-    reports = ReportStore()
-    decisions = DecisionStore()
-    risks = RiskStore()
-    notes = NoteStore()
-    rooms = PlanningRoomStore(jobs, notes)
+    ensure_all_project_folders(projects)
+    jobs = JobStore(projects)
+    reports = ReportStore(projects)
+    decisions = DecisionStore(projects)
+    risks = RiskStore(projects)
+    notes = NoteStore(projects)
+    rooms = PlanningRoomStore(projects, jobs, notes)
     Handler.projects = projects
     Handler.jobs = jobs
     Handler.reports = reports

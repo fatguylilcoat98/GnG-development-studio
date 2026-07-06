@@ -30,17 +30,19 @@ class Base(unittest.TestCase):
         s.ROOMS_PATH = os.path.join(self.tmp, "planning_rooms.jsonl")
         s.STUDIO_STATE_PATH = os.path.join(self.tmp, "studio_state.json")
         s.REPORTS_DIR = os.path.join(self.tmp, "reports_out")
+        s.PROJECTS_DIR = os.path.join(self.tmp, "projects")
         (self.projects, self.jobs, self.reports, self.decisions, self.risks,
          self.notes, self.rooms) = self._fresh_state()
 
     def _fresh_state(self):
         projects = s.load_projects()
-        jobs = s.JobStore()
-        reports = s.ReportStore()
-        decisions = s.DecisionStore()
-        risks = s.RiskStore()
-        notes = s.NoteStore()
-        rooms = s.PlanningRoomStore(jobs, notes)
+        s.ensure_all_project_folders(projects)
+        jobs = s.JobStore(projects)
+        reports = s.ReportStore(projects)
+        decisions = s.DecisionStore(projects)
+        risks = s.RiskStore(projects)
+        notes = s.NoteStore(projects)
+        rooms = s.PlanningRoomStore(projects, jobs, notes)
         return projects, jobs, reports, decisions, risks, notes, rooms
 
     def tearDown(self):
@@ -591,6 +593,326 @@ class TestHTTP(Base):
 
     def test_unknown_paths_404(self):
         self.assertEqual(self._req("/api/nope")[0], 404)
+
+
+# ─── project folders: persistent, file-based per-project memory ──────────────
+
+REQUIRED_TOP_FILES = ["PROJECT_STATE.md", "MISSION.md", "ARCHITECTURE.md",
+                      "DECISIONS.md", "RISKS.md", "ROADMAP.md", "NEXT_ACTION.md"]
+REQUIRED_SUBDIRS = ["CHATGPT", "CHATGPT/History", "CLAUDE", "CLAUDE/History",
+                   "COUNCIL", "COUNCIL/History", "REPORTS", "PRS", "SCREENSHOTS", "FILES"]
+
+
+def _history_count(history_dir):
+    """Entry count excluding the .gitkeep placeholder that makes the (git-tracked)
+    empty History/ directory actually persist once committed."""
+    return len([f for f in os.listdir(history_dir) if f != ".gitkeep"])
+
+
+class TestProjectFolders(Base):
+    """1: project folders created for every registered project."""
+
+    def test_folder_created_for_every_registered_project(self):
+        for pid in self.projects:
+            self.assertTrue(os.path.isdir(s.project_dir(pid)), pid)
+        self.assertEqual(len(self.projects), 11)
+
+
+class TestRequiredFiles(Base):
+    """2: required files created."""
+
+    def test_all_seven_top_level_files_exist_for_every_project(self):
+        for pid in self.projects:
+            for fname in REQUIRED_TOP_FILES:
+                path = os.path.join(s.project_dir(pid), fname)
+                self.assertTrue(os.path.exists(path), f"{pid}/{fname} missing")
+
+    def test_seed_content_is_not_empty_for_mission_and_next_action(self):
+        content = s._read_project_file("aubs-os", "MISSION.md")
+        self.assertIn("Mission", content)
+        # aubs-os seeds a real next_action string
+        self.assertNotEqual(s._read_project_file("aubs-os", "NEXT_ACTION.md"), "")
+
+
+class TestRequiredSubfolders(Base):
+    """3: required subfolders created."""
+
+    def test_all_required_subfolders_exist_for_every_project(self):
+        for pid in self.projects:
+            for sub in REQUIRED_SUBDIRS:
+                path = os.path.join(s.project_dir(pid), sub)
+                self.assertTrue(os.path.isdir(path), f"{pid}/{sub} missing")
+
+    def test_ensure_is_idempotent_and_never_clobbers_hand_edits(self):
+        s._write_project_file("aubs-os", "MISSION.md", "Chris hand-edited this mission.")
+        s.ensure_project_folder("aubs-os", self.projects["aubs-os"])
+        s.ensure_all_project_folders(self.projects)
+        self.assertEqual(s._read_project_file("aubs-os", "MISSION.md"),
+                         "Chris hand-edited this mission.")
+
+
+class TestProjectStateHeadings(Base):
+    """4: PROJECT_STATE.md contains all required headings."""
+
+    def test_skeleton_has_all_headings_on_first_boot(self):
+        content = s._read_project_file("aubs-os", "PROJECT_STATE.md")
+        for heading in s.PROJECT_STATE_HEADINGS:
+            self.assertIn(f"## {heading}", content, heading)
+
+    def test_regenerated_state_still_has_all_headings(self):
+        self.make_job(project="aubs-os")
+        content = s.sync_project_state("aubs-os", self.projects, self.jobs, self.reports,
+                                       self.decisions, self.risks, self.rooms)
+        for heading in s.PROJECT_STATE_HEADINGS:
+            self.assertIn(f"## {heading}", content, heading)
+        self.assertEqual(s._read_project_file("aubs-os", "PROJECT_STATE.md"), content)
+
+
+class TestNoOrphanJobs(Base):
+    """5: no orphan jobs allowed — every job/note/risk/decision/report/room must
+    be attached to exactly one registered project."""
+
+    def test_job_requires_a_known_project(self):
+        with self.assertRaises(ValueError):
+            self.jobs.create(project="", title="t", description="d")
+        with self.assertRaises(ValueError):
+            self.jobs.create(project="not-a-real-project", title="t", description="d")
+
+    def test_note_risk_decision_report_room_all_require_a_known_project(self):
+        with self.assertRaises(ValueError):
+            self.notes.create(project="ghost", note_type="architecture_note", content="x")
+        with self.assertRaises(ValueError):
+            self.risks.create(project="ghost", description="x")
+        with self.assertRaises(ValueError):
+            self.decisions.create(project="ghost", text="x")
+        with self.assertRaises(ValueError):
+            self.reports.ingest(job_id="j1", project="ghost", raw="STATUS: Complete")
+        with self.assertRaises(ValueError):
+            self.rooms.create(project="ghost", chris_idea="x")
+
+    def test_valid_project_succeeds(self):
+        job = self.make_job(project="veracore")
+        self.assertEqual(job["project"], "veracore")
+
+
+class TestChatGPTPlanWritesToFolder(Base):
+    """6: ChatGPT plan writes to project folder."""
+
+    def test_planning_room_chatgpt_response_writes_current_plan_and_history(self):
+        room = self.rooms.create("veracore", "idea")
+        self.rooms.paste_chatgpt_response(room["id"], "Use a static dashboard.")
+        current = s._read_project_file("veracore", os.path.join("CHATGPT", "Current_Plan.md"))
+        self.assertEqual(current, "Use a static dashboard.")
+        history_dir = os.path.join(s.project_dir("veracore"), "CHATGPT", "History")
+        self.assertEqual(_history_count(history_dir), 1)
+
+    def test_job_level_chatgpt_plan_ingestion_writes_current_plan(self):
+        job = self.make_job(project="veracore")
+        formatted = "## ChatGPT Plan Response\n\nSummary: do X\n"
+        s.save_chatgpt_plan_to_folder(job["project"], formatted)
+        self.assertIn("do X", s._read_project_file("veracore", os.path.join("CHATGPT", "Current_Plan.md")))
+
+    def test_multiple_pastes_accumulate_history_but_overwrite_current(self):
+        room = self.rooms.create("veracore", "idea")
+        self.rooms.paste_chatgpt_response(room["id"], "first")
+        self.rooms.paste_chatgpt_response(room["id"], "second")
+        self.assertEqual(s._read_project_file("veracore", os.path.join("CHATGPT", "Current_Plan.md")), "second")
+        history_dir = os.path.join(s.project_dir("veracore"), "CHATGPT", "History")
+        self.assertEqual(_history_count(history_dir), 2)
+
+
+class TestClaudeReportWritesToFolder(Base):
+    """7: Claude report writes to project folder."""
+
+    def test_report_ingestion_writes_current_report_and_history(self):
+        job = self.make_job(project="veracore")
+        self.reports.ingest(job["id"], job["project"], TestClaudeReportIngestion.GOOD_REPORT)
+        current = s._read_project_file("veracore", os.path.join("CLAUDE", "Current_Report.md"))
+        self.assertIn("STATUS: Complete", current)
+        history_dir = os.path.join(s.project_dir("veracore"), "CLAUDE", "History")
+        self.assertEqual(_history_count(history_dir), 1)
+
+    def test_planning_room_claude_response_also_writes_current_report(self):
+        room = self.rooms.create("veracore", "idea")
+        self.rooms.paste_chatgpt_response(room["id"], "x")
+        self.rooms.paste_claude_response(room["id"], "Independent critique text.")
+        self.assertEqual(s._read_project_file("veracore", os.path.join("CLAUDE", "Current_Report.md")),
+                         "Independent critique text.")
+
+
+class TestCouncilNotesWriteToFolder(Base):
+    """8: Council notes write to project folder."""
+
+    def test_council_response_writes_latest_and_history(self):
+        room = self.rooms.create("veracore", "idea")
+        self.rooms.paste_chatgpt_response(room["id"], "x")
+        self.rooms.paste_claude_response(room["id"], "y")
+        self.rooms.paste_council_response(room["id"], "Grok", "council take")
+        latest = s._read_project_file("veracore", os.path.join("COUNCIL", "Latest.md"))
+        self.assertIn("Grok", latest)
+        self.assertIn("council take", latest)
+        history_dir = os.path.join(s.project_dir("veracore"), "COUNCIL", "History")
+        self.assertEqual(_history_count(history_dir), 1)
+
+
+class TestDecisionsWriteToFolder(Base):
+    """9: decisions write to project folder."""
+
+    def test_decision_appends_to_decisions_md(self):
+        self.decisions.create("veracore", "Use approach Z")
+        content = s._read_project_file("veracore", "DECISIONS.md")
+        self.assertIn("Use approach Z", content)
+
+    def test_multiple_decisions_all_preserved(self):
+        self.decisions.create("veracore", "decision one")
+        self.decisions.create("veracore", "decision two")
+        content = s._read_project_file("veracore", "DECISIONS.md")
+        self.assertIn("decision one", content)
+        self.assertIn("decision two", content)
+
+
+class TestRisksWriteToFolder(Base):
+    """10: risks write to project folder."""
+
+    def test_risk_appends_to_risks_md(self):
+        self.risks.create("veracore", "Might break Y")
+        content = s._read_project_file("veracore", "RISKS.md")
+        self.assertIn("Might break Y", content)
+
+
+class TestNextActionWritesToFolder(Base):
+    """11: next action writes to project folder."""
+
+    def test_write_next_action_helper(self):
+        s.write_next_action_to_folder("veracore", "Ship the dashboard")
+        self.assertEqual(s._read_project_file("veracore", "NEXT_ACTION.md"), "Ship the dashboard")
+
+    def test_next_action_overwrites_not_appends(self):
+        s.write_next_action_to_folder("veracore", "first")
+        s.write_next_action_to_folder("veracore", "second")
+        content = s._read_project_file("veracore", "NEXT_ACTION.md")
+        self.assertEqual(content, "second")
+        self.assertNotIn("first", content)
+
+
+class TestWhereAreWeUsesFolderData(Base):
+    """12: Where Are We uses project folder data."""
+
+    def test_where_are_we_reflects_folder_files_not_just_jsonl(self):
+        s.save_chatgpt_plan_to_folder("veracore", "Folder-sourced ChatGPT plan text.")
+        text = s.build_where_are_we("veracore", self.projects, self.jobs, self.reports,
+                                    self.decisions, self.rooms)
+        self.assertIn("Folder-sourced ChatGPT plan text.", text)
+
+    def test_where_are_we_reflects_decisions_file(self):
+        self.decisions.create("veracore", "a durable decision")
+        text = s.build_where_are_we("veracore", self.projects, self.jobs, self.reports,
+                                    self.decisions, self.rooms)
+        self.assertIn("a durable decision", text)
+
+
+class TestStartNewChatPacketUsesFolderData(Base):
+    """13: Start New Chat Packet uses project folder data."""
+
+    def test_packet_includes_who_chris_is_and_folder_sourced_fields(self):
+        s._write_project_file("veracore", "ARCHITECTURE.md", "Static site, no backend.")
+        self.decisions.create("veracore", "keep it static")
+        s.write_next_action_to_folder("veracore", "ship v1")
+        text = s.build_start_new_chat_packet("veracore", self.projects, self.jobs, self.reports,
+                                             self.decisions, self.risks, self.rooms)
+        for expected in ("WHO CHRIS IS", "Static site, no backend.", "keep it static",
+                        "ship v1", "WHAT NOT TO WORK ON"):
+            self.assertIn(expected, text, expected)
+
+    def test_packet_warns_off_other_hands_off_projects(self):
+        text = s.build_start_new_chat_packet("veracore", self.projects, self.jobs, self.reports,
+                                             self.decisions, self.risks, self.rooms)
+        self.assertIn("PathBack", text)
+        self.assertIn("LYLO", text)
+        self.assertIn("Splendor", text)
+
+
+class TestContinuityPacketSurvivesRestart(Base):
+    """14: continuity packet survives restart — sourced from files on disk, so a
+    freshly constructed set of stores (simulating a process restart) reproduces
+    it without needing the original in-memory objects."""
+
+    def test_continuity_packet_rebuilds_after_simulated_restart(self):
+        job = self.make_job(project="veracore", title="Restart test")
+        self.reports.ingest(job["id"], "veracore", TestClaudeReportIngestion.GOOD_REPORT)
+        self.decisions.create("veracore", "durable decision")
+        self.risks.create("veracore", "durable risk")
+        before = s.build_continuity_packet("veracore", self.projects, self.jobs, self.reports,
+                                           self.decisions, self.risks, self.rooms)
+
+        # simulate a restart: brand-new store instances reloading from the same files
+        projects2 = s.load_projects()
+        jobs2 = s.JobStore(projects2)
+        reports2 = s.ReportStore(projects2)
+        decisions2 = s.DecisionStore(projects2)
+        risks2 = s.RiskStore(projects2)
+        notes2 = s.NoteStore(projects2)
+        rooms2 = s.PlanningRoomStore(projects2, jobs2, notes2)
+        after = s.build_continuity_packet("veracore", projects2, jobs2, reports2,
+                                          decisions2, risks2, rooms2)
+        self.assertEqual(before, after)
+        self.assertIn("durable decision", after)
+        self.assertIn("COMMIT: abc1234", after)
+
+
+class TestFounderReportIncludesProjectFolder(Base):
+    """15: founder report includes active project folder."""
+
+    def test_founder_report_names_the_active_project_folder_and_state(self):
+        s.set_active_project("veracore")
+        studio_state = s.load_studio_state()
+        s.sync_project_state("veracore", self.projects, self.jobs, self.reports,
+                             self.decisions, self.risks, self.rooms)
+        data = s.build_founder_report_data(self.projects, self.jobs, self.reports,
+                                           self.decisions, self.risks, studio_state)
+        self.assertEqual(data["active_project_folder"], s.project_dir("veracore"))
+        self.assertIn("Veracore", data["project_state"])
+        md = s.render_founder_report_markdown(data)
+        self.assertIn(s.project_dir("veracore"), md)
+        self.assertIn("## Current Project State", md)
+        self.assertIn("## Latest Council Notes", md)
+
+    def test_founder_report_with_no_active_project_is_graceful(self):
+        studio_state = {"active_project": None}
+        data = s.build_founder_report_data(self.projects, self.jobs, self.reports,
+                                           self.decisions, self.risks, studio_state)
+        self.assertIsNone(data["active_project_folder"])
+        md = s.render_founder_report_markdown(data)
+        self.assertIn("no active project set", md)
+
+
+class TestNoAPIsOrAutomationAdded(Base):
+    """16-18: no APIs, no deployment automation, no PM2/systemd/SSH/GitHub
+    automation added by this feature. Repo creation/push, when it happens, is
+    an operator/session-level git action outside this codebase — never code
+    inside studio.py or dashboard.html."""
+
+    def test_no_ai_api_hosts_in_project_folder_code_paths(self):
+        src = open(os.path.join(ROOT, "studio.py")).read()
+        for forbidden in ("api.openai.com", "api.anthropic.com", "x.ai/api",
+                          "generativelanguage.googleapis"):
+            self.assertNotIn(forbidden, src)
+
+    def test_no_deployment_or_service_management_keywords(self):
+        src = open(os.path.join(ROOT, "studio.py")).read()
+        for forbidden in ("pm2", "systemctl", "systemd", "paramiko", "docker",
+                          "kubectl"):
+            self.assertNotIn(forbidden, src)
+
+    def test_no_github_api_calls_in_studio_module(self):
+        src = open(os.path.join(ROOT, "studio.py")).read()
+        self.assertNotIn("api.github.com", src)
+        self.assertNotIn("import requests", src)
+
+    def test_project_folder_writes_are_plain_file_io_only(self):
+        src = open(os.path.join(ROOT, "studio.py")).read()
+        self.assertNotIn("import subprocess", src)
+        self.assertNotIn("Popen", src)
 
 
 if __name__ == "__main__":

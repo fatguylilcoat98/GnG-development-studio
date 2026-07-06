@@ -86,8 +86,11 @@
     <div class="row">
       <button class="ghost" onclick="whereAreWe()">Where are we?</button>
       <button class="ghost" onclick="continuityPacket()">Continuity Packet</button>
+      <button class="ghost" onclick="startNewChatPacket()">Start New Chat Packet</button>
     </div>
     <pre class="copyblock" id="utility-output" style="display:none"></pre>
+    <h3>Project State (PROJECT_STATE.md)</h3>
+    <pre class="copyblock" id="project-state-output">Select a project.</pre>
   </section>
 
   <!-- CENTER: planning room + new build request -->
@@ -250,7 +253,7 @@ async function selectProject(id){
   $('room-project-name').textContent=projects[id].name;
   await post(`/api/project/${id}/active`,{});
   renderProjectList();
-  await Promise.all([refreshJobs(),refreshRoom(),refreshNeedsChris()]);
+  await Promise.all([refreshJobs(),refreshRoom(),refreshNeedsChris(),refreshProjectState()]);
   renderNotes();
 }
 
@@ -274,7 +277,7 @@ async function saveDraft(){
     constraints:$('rq-constraints').value,safety_notes:$('rq-safety').value,
     approval_required:$('rq-approval').checked});
   if(r.error){alert(r.error);return;}
-  curJob=r.id;await refreshJobs();renderExec();
+  curJob=r.id;await refreshJobs();renderExec();refreshProjectState();
 }
 async function genChatGPTPrompt(){
   await saveDraft();
@@ -295,7 +298,7 @@ async function advanceCurJob(status){
   if(!curJob){alert('Select a job first.');return;}
   const r=await post(`/api/jobs/${curJob}/status`,{status});
   if(r.error)alert(r.error);
-  await refreshJobs();renderExec();
+  await refreshJobs();renderExec();refreshProjectState();
 }
 
 function renderExec(){
@@ -325,7 +328,7 @@ async function pasteClaudeReport(){
   $('exec-tests').textContent=r.tests||'—';
   $('exec-blockers').textContent=r.blockers||'—';
   $('rp-raw').value='';
-  refreshNeedsChris();
+  refreshNeedsChris();refreshProjectState();
 }
 async function pasteChatGPTPlan(){
   if(!curJob)return;
@@ -335,7 +338,7 @@ async function pasteChatGPTPlan(){
   if(r.error){alert(r.error);return;}
   $('exec-plan').textContent=r.plan_summary||'(saved)';
   ['cg-summary','cg-recommended','cg-risks','cg-decisions','cg-next'].forEach(id=>$(id).value='');
-  renderNotes();
+  renderNotes();refreshProjectState();
 }
 
 async function refreshRoom(){
@@ -364,14 +367,14 @@ async function pasteRoom(kind,textareaId){
   if(!curRoom)return;
   const r=await post(`/api/planning-rooms/${curRoom}/${kind}`,{text:$(textareaId).value});
   if(r.error){alert(r.error);return;}
-  $(textareaId).value='';await refreshRoom();
+  $(textareaId).value='';await refreshRoom();refreshProjectState();
 }
 async function pasteCouncil(){
   if(!curRoom)return;
   const r=await post(`/api/planning-rooms/${curRoom}/council-response`,
     {author:$('room-council-author').value,text:$('room-council-paste').value});
   if(r.error){alert(r.error);return;}
-  $('room-council-author').value='';$('room-council-paste').value='';await refreshRoom();
+  $('room-council-author').value='';$('room-council-paste').value='';await refreshRoom();refreshProjectState();
 }
 async function saveDisagreements(){
   if(!curRoom)return;
@@ -383,7 +386,7 @@ async function generateUnifiedPlan(){
   if(!curRoom)return;
   const r=await post(`/api/planning-rooms/${curRoom}/unified-plan`,{text:$('room-unified-plan').value});
   if(r.error){alert(r.error);return;}
-  await refreshRoom();
+  await refreshRoom();refreshProjectState();
 }
 async function markNeedsSignoff(){
   if(!curRoom)return;
@@ -395,7 +398,7 @@ async function chrisApproved(){
   if(!curRoom)return;
   const r=await post(`/api/planning-rooms/${curRoom}/chris-approved`,{note:'approved via dashboard'});
   if(r.error){alert(r.error);return;}
-  await refreshRoom();
+  await refreshRoom();refreshProjectState();
 }
 async function emergencySkip(){
   if(!curRoom)return;
@@ -403,14 +406,14 @@ async function emergencySkip(){
   if(reason===null)return;
   const r=await post(`/api/planning-rooms/${curRoom}/emergency-skip`,{reason});
   if(r.error){alert(r.error);return;}
-  await refreshRoom();
+  await refreshRoom();refreshProjectState();
 }
 async function generateRoomBuildPrompt(){
   if(!curRoom)return;
   const r=await post(`/api/planning-rooms/${curRoom}/build-prompt`,{});
   if(r.error){alert(r.error);return;}
   curJob=r.job.id;
-  await refreshJobs();renderExec();await refreshRoom();
+  await refreshJobs();renderExec();await refreshRoom();refreshProjectState();
   setTab('claude_code_prompt');
 }
 async function copyRoomPrompt(kind){
@@ -490,6 +493,17 @@ async function continuityPacket(){
   const r=await j(`/api/project/${curProject}/continuity-packet`);
   $('utility-output').style.display='block';$('utility-output').textContent=r.text;
   await copyText(r.text);
+}
+async function startNewChatPacket(){
+  if(!curProject){alert('Select a project first.');return;}
+  const r=await j(`/api/project/${curProject}/start-new-chat-packet`);
+  $('utility-output').style.display='block';$('utility-output').textContent=r.text;
+  await copyText(r.text);
+}
+async function refreshProjectState(){
+  if(!curProject){$('project-state-output').textContent='Select a project.';return;}
+  const r=await j(`/api/project/${curProject}/state`);
+  $('project-state-output').textContent=r.content;
 }
 async function refreshNeedsChris(){
   const r=await j('/api/needs-chris');

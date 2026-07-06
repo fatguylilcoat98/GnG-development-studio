@@ -71,6 +71,11 @@ scripts/
 state/                # gitignored — projects.json, jobs.jsonl, reports.jsonl,
                       # decisions.jsonl, notes.jsonl, risks.jsonl,
                       # planning_rooms.jsonl, studio_state.json
+projects/<slug>/      # NOT gitignored — durable, version-controlled per-project
+                      # memory (PROJECT_STATE.md, MISSION/ARCHITECTURE/ROADMAP.md,
+                      # DECISIONS.md, RISKS.md, NEXT_ACTION.md, CHATGPT/, CLAUDE/,
+                      # COUNCIL/, REPORTS/, PRS/, SCREENSHOTS/, FILES/) — see
+                      # docs/PROJECT_MODEL.md
 reports/              # gitignored generated output — regenerate any time
 docs/
   STUDIO_MISSION.md
