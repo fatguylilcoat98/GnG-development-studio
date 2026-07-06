@@ -1,0 +1,11 @@
+# Runtime state is re-seeded/accumulated at runtime, never version-controlled.
+state/
+
+# Generated founder/status reports — regenerate with scripts/founder-report.sh
+reports/*.md
+
+# Python / OS cruft
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store

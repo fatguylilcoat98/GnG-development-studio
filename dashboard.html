@@ -1,0 +1,512 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GNG Development Studio</title>
+<style>
+  :root{--bg:#0b1020;--panel:#121a30;--line:#22304f;--txt:#dbe4f5;--dim:#8ea0c0;
+        --ok:#3ecf8e;--bad:#ff6b6b;--warn:#ffc857;--accent:#5aa7ff;--pin:#ffd166}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font:14px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}
+  header{display:flex;align-items:baseline;gap:14px;padding:14px 20px;border-bottom:1px solid var(--line)}
+  h1{font-size:17px;margin:0}
+  .tag{color:var(--dim);font-size:12px}
+  #needs-chris{display:none;margin:0 20px;background:#3a1420;border:1px solid var(--bad);
+       color:var(--bad);border-radius:10px;padding:10px 16px}
+  #needs-chris b{color:#fff}
+  #needs-chris .item{padding:3px 0}
+  main{display:grid;gap:14px;padding:16px 20px;max-width:1620px;margin:0 auto;
+       grid-template-columns:230px 1fr 320px;
+       grid-template-areas:"left center right" "bottom bottom bottom"}
+  @media(max-width:1050px){main{grid-template-columns:1fr;
+       grid-template-areas:"left" "center" "right" "bottom"}}
+  section{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
+  #pane-left{grid-area:left} #pane-center{grid-area:center}
+  #pane-right{grid-area:right} #pane-bottom{grid-area:bottom}
+  h2{font-size:12px;margin:0 0 10px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em}
+  h3{font-size:12px;margin:14px 0 6px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--dim);font-weight:600}
+  .pill{display:inline-block;padding:1px 9px;border-radius:99px;font-size:11px;border:1px solid var(--line)}
+  .ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)} .dim{color:var(--dim)}
+  button{background:var(--accent);color:#08111f;border:0;border-radius:7px;
+         padding:5px 11px;font-weight:600;cursor:pointer;font-size:12.5px}
+  button:disabled{opacity:.35;cursor:not-allowed}
+  button.danger{background:var(--bad)} button.ghost{background:transparent;color:var(--accent);border:1px solid var(--line)}
+  input,textarea,select{background:#0d1426;border:1px solid var(--line);color:var(--txt);
+       border-radius:7px;padding:6px 9px;font:inherit;font-size:13.5px;width:100%}
+  textarea{min-height:56px;resize:vertical}
+  label{display:grid;gap:3px;font-size:12px;color:var(--dim);margin-bottom:9px}
+  .check{display:flex;align-items:center;gap:8px;color:var(--txt);font-size:13px}
+  .check input{width:auto}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  #project-list{list-style:none;margin:0 0 6px;padding:0}
+  #project-list li{padding:7px 9px;border-radius:7px;cursor:pointer;display:flex;
+       justify-content:space-between;gap:6px;align-items:baseline}
+  #project-list li:hover{background:#182240}
+  #project-list li.active{background:#1b2a52;outline:1px solid var(--accent)}
+  .hands-off{font-size:10px;color:var(--warn)}
+  #job-list{list-style:none;margin:0;padding:0}
+  #job-list li{padding:6px 8px;border-radius:7px;cursor:pointer;display:flex;justify-content:space-between;gap:8px}
+  #job-list li:hover{background:#182240}
+  #job-list li.active{background:#1b2a52;outline:1px solid var(--accent)}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:13px}
+  .kv b{color:var(--dim);font-weight:600;font-size:12px}
+  .stagebar{display:flex;gap:3px;margin:6px 0 10px}
+  .stagebar i{flex:1;height:6px;border-radius:3px;background:#1a2440}
+  .stagebar i.on{background:var(--accent)}
+  .tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+  .tabs button{background:transparent;color:var(--dim);border:1px solid var(--line)}
+  .tabs button.active{color:var(--accent);border-color:var(--accent)}
+  .note{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:10px;background:#0d1426}
+  .note .meta{display:flex;gap:10px;align-items:center;font-size:11.5px;color:var(--dim);margin-bottom:6px}
+  .note pre{margin:0;white-space:pre-wrap;font-size:12.5px;max-height:260px;overflow:auto}
+  code{font-size:11.5px;color:var(--dim)}
+  details.room summary{cursor:pointer;color:var(--accent);font-size:13px;padding:4px 2px;font-weight:600}
+  pre.copyblock{background:#0d1426;border:1px solid var(--line);border-radius:8px;padding:10px;
+       white-space:pre-wrap;font-size:12px;max-height:220px;overflow:auto}
+</style>
+</head>
+<body>
+<header>
+  <h1>GNG Development Studio</h1>
+  <span class="tag">build coordination cockpit · <span id="hmode">…</span></span>
+</header>
+<div id="needs-chris"><b>⚠ Needs Chris</b><div id="needs-chris-items"></div></div>
+<main>
+
+  <!-- LEFT: projects -->
+  <section id="pane-left">
+    <h2>Projects</h2>
+    <input id="proj-search" placeholder="Search projects…" oninput="renderProjectList()">
+    <ul id="project-list"></ul>
+    <div class="row">
+      <button class="ghost" onclick="whereAreWe()">Where are we?</button>
+      <button class="ghost" onclick="continuityPacket()">Continuity Packet</button>
+    </div>
+    <pre class="copyblock" id="utility-output" style="display:none"></pre>
+  </section>
+
+  <!-- CENTER: planning room + new build request -->
+  <section id="pane-center">
+    <h2>Planning Room — <span id="room-project-name" class="dim">select a project</span></h2>
+    <div id="room-body">
+      <div id="room-none" class="dim">No planning room yet for this project.</div>
+      <div id="room-active" style="display:none">
+        <div class="row"><span class="pill" id="room-status"></span>
+          <button class="ghost" onclick="copyRoomPrompt('chatgpt')">Copy prompt for ChatGPT</button>
+          <button class="ghost" onclick="copyRoomPrompt('claude')">Copy prompt for Claude</button>
+          <button class="ghost" onclick="copyRoomPrompt('council')">Copy Council Prompt</button>
+        </div>
+        <h3>Chris's original idea</h3>
+        <pre class="copyblock" id="room-idea"></pre>
+        <h3>Paste ChatGPT response</h3>
+        <textarea id="room-chatgpt-paste"></textarea>
+        <button class="ghost" onclick="pasteRoom('chatgpt-response','room-chatgpt-paste')">Paste ChatGPT Response</button>
+        <h3>Paste Claude response</h3>
+        <textarea id="room-claude-paste"></textarea>
+        <button class="ghost" onclick="pasteRoom('claude-response','room-claude-paste')">Paste Claude Response</button>
+        <h3>Council / other AI response</h3>
+        <input id="room-council-author" placeholder="Who / which model?">
+        <textarea id="room-council-paste"></textarea>
+        <button class="ghost" onclick="pasteCouncil()">Paste Council Response</button>
+        <h3>Disagreements &amp; risks</h3>
+        <textarea id="room-disagreements" placeholder="Disagreements"></textarea>
+        <textarea id="room-risks" placeholder="Risks"></textarea>
+        <button class="ghost" onclick="saveDisagreements()">Save disagreements/risks</button>
+        <h3>Unified plan</h3>
+        <textarea id="room-unified-plan"></textarea>
+        <div class="row">
+          <button onclick="generateUnifiedPlan()">Generate Unified Plan Draft</button>
+          <button class="ghost" onclick="markNeedsSignoff()">Mark Needs Chris Sign-Off</button>
+          <button onclick="chrisApproved()">Chris Approved</button>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button onclick="generateRoomBuildPrompt()">Generate Claude Code Build Prompt</button>
+          <button class="danger" onclick="emergencySkip()">Emergency Build / Skip Planning</button>
+        </div>
+      </div>
+    </div>
+    <details><summary class="dim">＋ Start a new planning room (new idea)</summary>
+      <label>Chris's original idea<textarea id="new-idea"></textarea></label>
+      <button onclick="createRoom()">Start Planning Room</button>
+    </details>
+
+    <h2 style="margin-top:18px">Build Request</h2>
+    <label>Title<input id="rq-title"></label>
+    <label>Description<textarea id="rq-desc"></textarea></label>
+    <div class="row">
+      <label class="dim" style="flex:1">Priority
+        <select id="rq-priority"><option>low</option><option selected>normal</option>
+          <option>high</option><option>emergency</option></select></label>
+      <label class="check" style="margin-top:14px"><input type="checkbox" id="rq-approval" checked>
+        Approval required</label>
+    </div>
+    <label>Constraints<textarea id="rq-constraints"></textarea></label>
+    <label>Safety notes<textarea id="rq-safety"></textarea></label>
+    <div class="row">
+      <button class="ghost" onclick="saveDraft()">Save Draft</button>
+      <button onclick="genChatGPTPrompt()">Generate ChatGPT Plan Prompt</button>
+      <button onclick="genClaudePrompt()">Generate Claude Code Build Prompt</button>
+    </div>
+    <div class="row">
+      <button class="ghost" onclick="advanceCurJob('Ready for ChatGPT')">Mark Sent to ChatGPT</button>
+      <button class="ghost" onclick="advanceCurJob('Sent to Claude')">Mark Sent to Claude</button>
+      <button class="ghost" onclick="advanceCurJob('Building')">Mark Waiting on Claude</button>
+      <button class="ghost" onclick="advanceCurJob('Needs Chris Approval')">Mark Needs Chris</button>
+      <button class="ghost" onclick="advanceCurJob('Completed')">Mark Complete</button>
+    </div>
+    <h3>Jobs</h3>
+    <ul id="job-list"></ul>
+  </section>
+
+  <!-- RIGHT: current work / execution -->
+  <section id="pane-right">
+    <h2>Current Work</h2>
+    <div id="exec-empty" class="dim">Select a job to see its state.</div>
+    <div id="exec-body" style="display:none">
+      <div class="kv">
+        <b>Project</b><span id="exec-project"></span>
+        <b>Job</b><span id="exec-title"></span>
+        <b>Stage</b><span id="exec-stage"></span>
+        <b>Needs approval</b><span id="exec-approval"></span>
+        <b>Latest commit</b><span id="exec-commit" class="dim"></span>
+        <b>Tests</b><span id="exec-tests" class="dim"></span>
+        <b>Blockers</b><span id="exec-blockers" class="dim"></span>
+      </div>
+      <div class="stagebar" id="exec-stagebar"></div>
+      <div class="row" id="exec-advance"></div>
+      <h3>Latest Claude report</h3>
+      <pre class="copyblock" id="exec-report">—</pre>
+      <h3>Latest ChatGPT plan</h3>
+      <pre class="copyblock" id="exec-plan">—</pre>
+      <details><summary class="dim">Paste Claude report</summary>
+        <textarea id="rp-raw" placeholder="Paste Claude's final status block here"></textarea>
+        <button onclick="pasteClaudeReport()">Save report</button>
+      </details>
+      <details><summary class="dim">Paste ChatGPT plan response</summary>
+        <textarea id="cg-summary" placeholder="Plan summary"></textarea>
+        <textarea id="cg-recommended" placeholder="Recommended prompt"></textarea>
+        <textarea id="cg-risks" placeholder="Risks"></textarea>
+        <textarea id="cg-decisions" placeholder="Decisions"></textarea>
+        <textarea id="cg-next" placeholder="Next step"></textarea>
+        <button onclick="pasteChatGPTPlan()">Save plan</button>
+      </details>
+    </div>
+  </section>
+
+  <!-- BOTTOM: conversation workspace -->
+  <section id="pane-bottom">
+    <h2>Conversation Workspace</h2>
+    <div class="tabs" id="conv-tabs">
+      <button data-tab="chatgpt_plan" class="active" onclick="setTab('chatgpt_plan')">ChatGPT Plan</button>
+      <button data-tab="claude_code_prompt" onclick="setTab('claude_code_prompt')">Claude Code Prompt</button>
+      <button data-tab="claude_report" onclick="setTab('claude_report')">Claude Report</button>
+      <button data-tab="architecture_note" onclick="setTab('architecture_note')">Architecture Notes</button>
+      <button data-tab="decision_log" onclick="setTab('decision_log')">Decision Log</button>
+      <button data-tab="risks" onclick="setTab('risks')">Risks</button>
+      <button data-tab="next_steps" onclick="setTab('next_steps')">Next Steps</button>
+    </div>
+    <div id="note-add" style="display:none">
+      <label>New entry<textarea id="note-content"></textarea></label>
+      <button onclick="addNote()">Add</button>
+    </div>
+    <div id="notes"></div>
+  </section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+let projects={}, curProject=null, curJob=null, curRoom=null, curTab='chatgpt_plan';
+let jobsById={}, roomsByProject={};
+
+async function j(url,opts){const r=await fetch(url,opts);return r.json();}
+function esc(s){const d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML;}
+async function post(url,body){return j(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});}
+async function copyText(text){
+  try{await navigator.clipboard.writeText(text);}
+  catch(e){const ta=document.createElement('textarea');ta.value=text;document.body.appendChild(ta);
+    ta.select();document.execCommand('copy');ta.remove();}
+}
+
+async function loadMeta(){
+  const m=await j('/api/projects');
+  projects=Object.fromEntries(m.projects.map(p=>[p.id,p]));
+  $('hmode').textContent=`${m.job_lifecycle.length}-stage lifecycle`;
+  renderProjectList();
+}
+function renderProjectList(){
+  const q=($('proj-search').value||'').toLowerCase();
+  $('project-list').innerHTML=Object.values(projects)
+    .filter(p=>!q||p.name.toLowerCase().includes(q))
+    .map(p=>`<li class="${p.id===curProject?'active':''}" onclick="selectProject('${p.id}')">
+      <span>${esc(p.name)}${p.hands_off?' <span class="hands-off">hands-off</span>':''}</span>
+      <span class="dim">${esc(p.status||'')}</span></li>`).join('');
+}
+async function selectProject(id){
+  curProject=id;curJob=null;
+  $('room-project-name').textContent=projects[id].name;
+  await post(`/api/project/${id}/active`,{});
+  renderProjectList();
+  await Promise.all([refreshJobs(),refreshRoom(),refreshNeedsChris()]);
+  renderNotes();
+}
+
+async function refreshJobs(){
+  if(!curProject){$('job-list').innerHTML='';return;}
+  const r=await j(`/api/jobs?project=${encodeURIComponent(curProject)}`);
+  jobsById={};
+  $('job-list').innerHTML=r.jobs.map(x=>{
+    jobsById[x.id]=x;
+    return `<li class="${x.id===curJob?'active':''}" onclick="selectJob('${x.id}')">
+      <span><b>${esc(x.title)}</b></span><span class="pill">${esc(x.status)}</span></li>`;
+  }).join('')||'<li class="dim" style="cursor:default">No jobs yet.</li>';
+}
+function selectJob(id){curJob=id;refreshJobs();renderExec();renderNotes();}
+
+async function saveDraft(){
+  if(!curProject){alert('Select a project first.');return;}
+  if(!$('rq-title').value.trim()||!$('rq-desc').value.trim()){alert('Title and description required.');return;}
+  const r=await post('/api/jobs',{project:curProject,title:$('rq-title').value,
+    description:$('rq-desc').value,priority:$('rq-priority').value,
+    constraints:$('rq-constraints').value,safety_notes:$('rq-safety').value,
+    approval_required:$('rq-approval').checked});
+  if(r.error){alert(r.error);return;}
+  curJob=r.id;await refreshJobs();renderExec();
+}
+async function genChatGPTPrompt(){
+  await saveDraft();
+  if(!curJob)return;
+  const r=await post(`/api/jobs/${curJob}/generate-chatgpt-prompt`,{});
+  if(r.error){alert(r.error);return;}
+  await copyText(r.prompt);
+  await refreshJobs();renderExec();setTab('chatgpt_plan');
+}
+async function genClaudePrompt(){
+  if(!curJob){alert('Save a draft first.');return;}
+  const r=await post(`/api/jobs/${curJob}/generate-claude-prompt`,{});
+  if(r.error){alert(r.error);return;}
+  await copyText(r.prompt);
+  await refreshJobs();renderExec();setTab('claude_code_prompt');
+}
+async function advanceCurJob(status){
+  if(!curJob){alert('Select a job first.');return;}
+  const r=await post(`/api/jobs/${curJob}/status`,{status});
+  if(r.error)alert(r.error);
+  await refreshJobs();renderExec();
+}
+
+function renderExec(){
+  const job=jobsById[curJob];
+  $('exec-empty').style.display=job?'none':'block';
+  $('exec-body').style.display=job?'block':'none';
+  if(!job)return;
+  $('exec-project').textContent=projects[job.project]?.name||job.project;
+  $('exec-title').textContent=job.title;
+  $('exec-stage').textContent=job.status;
+  $('exec-approval').textContent=job.approval_required?'yes':'no';
+  const stages=["Draft","Planning","Ready for ChatGPT","ChatGPT Planned","Ready for Claude",
+    "Sent to Claude","Building","Testing","Needs Chris Approval","Approved","Completed","Archived"];
+  const idx=stages.indexOf(job.status);
+  $('exec-stagebar').innerHTML=stages.map((s,i)=>`<i class="${i<=idx?'on':''}" title="${s}"></i>`).join('');
+  $('exec-advance').innerHTML=(job.allowed_next||[]).map(s=>
+    `<button class="ghost" onclick="advanceCurJob('${s.replace(/'/g,"\\'")}')">${esc(s)}</button>`).join('')
+    ||'<span class="dim">terminal</span>';
+  j(`/api/jobs?project=${job.project}`); // keep list warm
+}
+async function pasteClaudeReport(){
+  if(!curJob)return;
+  const r=await post(`/api/jobs/${curJob}/claude-report`,{raw:$('rp-raw').value});
+  if(r.error){alert(r.error);return;}
+  $('exec-report').textContent=r.raw;
+  $('exec-commit').textContent=r.commit||'—';
+  $('exec-tests').textContent=r.tests||'—';
+  $('exec-blockers').textContent=r.blockers||'—';
+  $('rp-raw').value='';
+  refreshNeedsChris();
+}
+async function pasteChatGPTPlan(){
+  if(!curJob)return;
+  const r=await post(`/api/jobs/${curJob}/chatgpt-plan`,{plan_summary:$('cg-summary').value,
+    recommended_prompt:$('cg-recommended').value,risks:$('cg-risks').value,
+    decisions:$('cg-decisions').value,next_step:$('cg-next').value});
+  if(r.error){alert(r.error);return;}
+  $('exec-plan').textContent=r.plan_summary||'(saved)';
+  ['cg-summary','cg-recommended','cg-risks','cg-decisions','cg-next'].forEach(id=>$(id).value='');
+  renderNotes();
+}
+
+async function refreshRoom(){
+  if(!curProject)return;
+  const r=await j(`/api/planning-rooms?project=${encodeURIComponent(curProject)}`);
+  const room=r.rooms[0];
+  if(!room){$('room-none').style.display='block';$('room-active').style.display='none';curRoom=null;return;}
+  curRoom=room.id;
+  $('room-none').style.display='none';$('room-active').style.display='block';
+  $('room-status').textContent=room.status;
+  $('room-idea').textContent=room.chris_idea;
+  $('room-unified-plan').value=room.unified_plan||'';
+  $('room-disagreements').value=room.disagreements||'';
+  $('room-risks').value=room.risks||'';
+}
+async function createRoom(){
+  if(!curProject){alert('Select a project first.');return;}
+  const idea=$('new-idea').value.trim();
+  if(!idea){alert('Describe the idea first.');return;}
+  const r=await post('/api/planning-rooms',{project:curProject,chris_idea:idea});
+  if(r.error){alert(r.error);return;}
+  $('new-idea').value='';
+  await refreshRoom();
+}
+async function pasteRoom(kind,textareaId){
+  if(!curRoom)return;
+  const r=await post(`/api/planning-rooms/${curRoom}/${kind}`,{text:$(textareaId).value});
+  if(r.error){alert(r.error);return;}
+  $(textareaId).value='';await refreshRoom();
+}
+async function pasteCouncil(){
+  if(!curRoom)return;
+  const r=await post(`/api/planning-rooms/${curRoom}/council-response`,
+    {author:$('room-council-author').value,text:$('room-council-paste').value});
+  if(r.error){alert(r.error);return;}
+  $('room-council-author').value='';$('room-council-paste').value='';await refreshRoom();
+}
+async function saveDisagreements(){
+  if(!curRoom)return;
+  await post(`/api/planning-rooms/${curRoom}/disagreements`,
+    {disagreements:$('room-disagreements').value,risks:$('room-risks').value});
+  await refreshRoom();
+}
+async function generateUnifiedPlan(){
+  if(!curRoom)return;
+  const r=await post(`/api/planning-rooms/${curRoom}/unified-plan`,{text:$('room-unified-plan').value});
+  if(r.error){alert(r.error);return;}
+  await refreshRoom();
+}
+async function markNeedsSignoff(){
+  if(!curRoom)return;
+  const r=await post(`/api/planning-rooms/${curRoom}/needs-signoff`,{});
+  if(r.error){alert(r.error);return;}
+  await refreshRoom();
+}
+async function chrisApproved(){
+  if(!curRoom)return;
+  const r=await post(`/api/planning-rooms/${curRoom}/chris-approved`,{note:'approved via dashboard'});
+  if(r.error){alert(r.error);return;}
+  await refreshRoom();
+}
+async function emergencySkip(){
+  if(!curRoom)return;
+  const reason=prompt('Reason for emergency skip:');
+  if(reason===null)return;
+  const r=await post(`/api/planning-rooms/${curRoom}/emergency-skip`,{reason});
+  if(r.error){alert(r.error);return;}
+  await refreshRoom();
+}
+async function generateRoomBuildPrompt(){
+  if(!curRoom)return;
+  const r=await post(`/api/planning-rooms/${curRoom}/build-prompt`,{});
+  if(r.error){alert(r.error);return;}
+  curJob=r.job.id;
+  await refreshJobs();renderExec();await refreshRoom();
+  setTab('claude_code_prompt');
+}
+async function copyRoomPrompt(kind){
+  if(!curRoom)return;
+  const endpoint={chatgpt:'chatgpt-prompt',claude:'claude-prompt',council:'council-prompt'}[kind];
+  const r=await j(`/api/planning-rooms/${curRoom}/${endpoint}`);
+  if(r.error){alert(r.error);return;}
+  await copyText(r.prompt);
+  alert('Copied.');
+}
+
+function setTab(tab){
+  curTab=tab;
+  document.querySelectorAll('#conv-tabs button').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));
+  renderNotes();
+}
+const TAB_TO_NOTE_TYPE={chatgpt_plan:'chatgpt_plan',claude_code_prompt:'claude_code_prompt',
+  architecture_note:'architecture_note',next_steps:'next_steps'};
+async function renderNotes(){
+  if(!curProject){$('notes').innerHTML='<div class="dim">Select a project.</div>';return;}
+  if(curTab==='claude_report'){
+    const r=await j(`/api/jobs?project=${encodeURIComponent(curProject)}`);
+    const jobIds=r.jobs.map(x=>x.id);
+    const rr=await j(`/api/founder-report`);
+    $('note-add').style.display='none';
+    const reports=(await Promise.all(jobIds.map(id=>j(`/api/notes?job=${id}`)))).length; // no-op warm
+    const all=await j(`/api/jobs?project=${encodeURIComponent(curProject)}`);
+    $('notes').innerHTML='<div class="dim">Reports show in the Current Work panel and Founder Report.</div>';
+    return;
+  }
+  if(curTab==='decision_log'){
+    $('note-add').style.display='none';
+    const d=await j(`/api/decisions?project=${encodeURIComponent(curProject)}`);
+    $('notes').innerHTML=d.decisions.map(x=>`<div class="note"><div class="meta">
+      <span>${new Date(x.created_at*1000).toLocaleString()}</span><span>${esc(x.source)}</span></div>
+      <pre>${esc(x.text)}</pre></div>`).join('')||'<div class="dim">No decisions logged.</div>';
+    return;
+  }
+  if(curTab==='risks'){
+    $('note-add').style.display='none';
+    const rr=await j(`/api/risks?project=${encodeURIComponent(curProject)}`);
+    $('notes').innerHTML=rr.risks.map(x=>`<div class="note"><div class="meta">
+      <span class="${x.resolved?'dim':'warn'}">${x.resolved?'resolved':x.severity}</span>
+      <span>${new Date(x.created_at*1000).toLocaleString()}</span></div>
+      <pre>${esc(x.description)}</pre></div>`).join('')||'<div class="dim">No risks logged.</div>';
+    return;
+  }
+  const noteType=TAB_TO_NOTE_TYPE[curTab];
+  $('note-add').style.display=(curTab==='architecture_note'||curTab==='next_steps')?'block':'none';
+  const r=await j(`/api/notes?project=${encodeURIComponent(curProject)}&type=${noteType}`);
+  $('notes').innerHTML=r.notes.map(n=>`<div class="note"><div class="meta">
+    <span>${new Date(n.created_at*1000).toLocaleString()}</span><span>${esc(n.author)}</span>
+    <span style="flex:1"></span><button class="ghost" onclick="copyNote('${n.id}',this)">Copy</button></div>
+    <pre id="note-pre-${n.id}">${esc(n.content||n.plan_summary||'')}</pre></div>`).join('')
+    ||'<div class="dim">Nothing here yet.</div>';
+}
+async function addNote(){
+  const content=$('note-content').value.trim();
+  if(!content||!curProject)return;
+  await post('/api/notes',{project:curProject,job_id:curJob,note_type:curTab,content});
+  $('note-content').value='';renderNotes();
+}
+async function copyNote(id,btn){
+  const text=document.getElementById(`note-pre-${id}`).textContent;
+  await copyText(text);
+  const old=btn.textContent;btn.textContent='Copied ✓';setTimeout(()=>btn.textContent=old,1500);
+}
+
+async function whereAreWe(){
+  if(!curProject){alert('Select a project first.');return;}
+  const r=await j(`/api/project/${curProject}/where-are-we`);
+  $('utility-output').style.display='block';$('utility-output').textContent=r.text;
+  await copyText(r.text);
+}
+async function continuityPacket(){
+  if(!curProject){alert('Select a project first.');return;}
+  const r=await j(`/api/project/${curProject}/continuity-packet`);
+  $('utility-output').style.display='block';$('utility-output').textContent=r.text;
+  await copyText(r.text);
+}
+async function refreshNeedsChris(){
+  const r=await j('/api/needs-chris');
+  const box=$('needs-chris');
+  if(!r.items.length){box.style.display='none';return;}
+  box.style.display='block';
+  $('needs-chris-items').innerHTML=r.items.map(it=>
+    `<div class="item">${esc(it.project)}: ${esc(it.reason)} — choices: ${it.choices.map(esc).join(', ')}</div>`).join('');
+}
+
+(async()=>{
+  await loadMeta();
+  await refreshNeedsChris();
+  const first=Object.keys(projects)[0];
+  if(first)await selectProject(first);
+  setInterval(refreshNeedsChris,10000);
+})();
+</script>
+</body>
+</html>
