@@ -776,11 +776,17 @@ def verify_outcome_files(folder, files_changed):
     """Catch the Decision Deck failure mode on disk, not just trust the report:
     a build was marked Complete, but the recorded folder was empty, missing,
     or was actually Studio's OWN per-project bookkeeping directory
-    (projects/<slug>/ — ARCHITECTURE.md, CLAUDE/, REPORTS/, ... — auto-created
-    for every registered project by ensure_project_folder, never application
-    code) rather than wherever the real app was supposed to be written. Runs
-    wherever studio.py actually executes, so this checks the real filesystem
-    Studio is running on."""
+    (projects/<slug>/ itself — ARCHITECTURE.md, CLAUDE/, REPORTS/, ...,
+    auto-created for every registered project by ensure_project_folder, never
+    application code) rather than wherever the real app was supposed to be
+    written. Runs wherever studio.py actually executes, so this checks the
+    real filesystem Studio is running on.
+
+    Only the bookkeeping directory ITSELF (a direct child of PROJECTS_DIR) is
+    flagged — a subfolder beneath it, e.g. projects/<slug>/app/, is a
+    perfectly legitimate place for real application code (exactly the layout
+    Studio itself recommends when a project's own folder can't be used
+    directly) and must NOT be flagged just for living under PROJECTS_DIR."""
     result = {"folder_exists": False, "is_studio_metadata_folder": False,
              "missing_files": [], "checked_files": [], "warning": None}
     if not folder:
@@ -789,7 +795,12 @@ def verify_outcome_files(folder, files_changed):
     expanded = os.path.expanduser(str(folder))
     real = os.path.realpath(expanded)
     real_projects_dir = os.path.realpath(PROJECTS_DIR)
-    if real == real_projects_dir or real.startswith(real_projects_dir + os.sep):
+    if real == real_projects_dir:
+        is_metadata_folder = True
+    else:
+        rel = os.path.relpath(real, real_projects_dir)
+        is_metadata_folder = not rel.startswith(os.pardir) and len(rel.split(os.sep)) == 1
+    if is_metadata_folder:
         result["is_studio_metadata_folder"] = True
         result["warning"] = ("This folder is Studio's own project bookkeeping directory "
                              "(ARCHITECTURE.md, CLAUDE/, REPORTS/, ...), not application "

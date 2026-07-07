@@ -1521,6 +1521,28 @@ class TestVerifyOutcomeFiles(Base):
         self.assertTrue(result["is_studio_metadata_folder"])
         self.assertIn("bookkeeping directory", result["warning"])
 
+    def test_projects_dir_itself_is_flagged(self):
+        result = s.verify_outcome_files(s.PROJECTS_DIR, "index.html")
+        self.assertTrue(result["is_studio_metadata_folder"])
+
+    def test_app_subfolder_beneath_bookkeeping_dir_is_NOT_flagged(self):
+        """Regression: projects/<slug>/app/ is exactly the layout Studio
+        itself recommends for a project whose own folder is bookkeeping-only
+        (the real Decision Deck fix) -- it must never be mistaken for the
+        bookkeeping directory just because it lives under PROJECTS_DIR."""
+        folder = os.path.join(s.PROJECTS_DIR, "veracore", "app")
+        os.makedirs(folder, exist_ok=True)
+        open(os.path.join(folder, "index.html"), "w").close()
+        result = s.verify_outcome_files(folder, "index.html")
+        self.assertFalse(result["is_studio_metadata_folder"])
+        self.assertIsNone(result["warning"])
+
+    def test_deeply_nested_subfolder_is_also_not_flagged(self):
+        folder = os.path.join(s.PROJECTS_DIR, "veracore", "app", "dist")
+        os.makedirs(folder, exist_ok=True)
+        result = s.verify_outcome_files(folder, "")
+        self.assertFalse(result["is_studio_metadata_folder"])
+
     def test_nonexistent_folder_warns(self):
         result = s.verify_outcome_files("/no/such/path/anywhere-xyz", "index.html")
         self.assertIn("does not exist", result["warning"])
