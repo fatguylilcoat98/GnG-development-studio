@@ -32,6 +32,7 @@ class Base(unittest.TestCase):
         s.RISKS_PATH = os.path.join(self.tmp, "risks.jsonl")
         s.ROOMS_PATH = os.path.join(self.tmp, "planning_rooms.jsonl")
         s.STUDIO_STATE_PATH = os.path.join(self.tmp, "studio_state.json")
+        s.BUILDS_PATH = os.path.join(self.tmp, "builds.jsonl")
         s.REPORTS_DIR = os.path.join(self.tmp, "reports_out")
         s.PROJECTS_DIR = os.path.join(self.tmp, "projects")
         (self.projects, self.jobs, self.reports, self.decisions, self.risks,
@@ -1810,6 +1811,234 @@ class TestOutcomesHTTP(_HTTPBase):
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/outcomes", timeout=5) as r:
             self.assertEqual(r.status, 200)
             self.assertIn(b"<html", r.read()[:200].lower())
+
+
+# ─── Browser Handoff builds (Development Studio v1) ──────────────────────────
+
+BUILDER_OK = ("WHAT WAS INSPECTED: everything\nWHAT WAS CHANGED: index.html\n"
+             "TESTS RUN: 3/3 pass\nBLOCKERS: none\nHUMAN APPROVALS NEEDED: none\n"
+             "FINAL STATUS: done\nRESULT: COMPLETE")
+REVIEWER_PASS = ("PASS/FAIL: pass\nEVIDENCE: checked\nRISKS: none\n"
+                "MISSED REQUIREMENTS: none\nREGRESSION CONCERNS: none\n"
+                "FINAL RECOMMENDATION: ship it\nRESULT: REVIEW_PASS")
+REVIEWER_FAIL = REVIEWER_PASS.replace("RESULT: REVIEW_PASS", "RESULT: REVIEW_FAIL")
+
+
+class TestResponseParser(unittest.TestCase):
+    def test_result_line_wins(self):
+        for token in s.RESPONSE_OUTCOMES:
+            outcome, ok = s.parse_worker_response(f"blah blah\nRESULT: {token}\n")
+            self.assertEqual((outcome, ok), (token, True), token)
+
+    def test_result_line_tolerates_spaces_and_case(self):
+        self.assertEqual(s.parse_worker_response("result: review pass"),
+                         ("REVIEW_PASS", True))
+
+    def test_single_bare_token_is_confident(self):
+        self.assertEqual(s.parse_worker_response("the tests failed, sorry"),
+                         ("TESTS_FAILED", True))
+
+    def test_no_token_is_not_confident(self):
+        outcome, ok = s.parse_worker_response("I did some stuff and it seems fine")
+        self.assertEqual((outcome, ok), (None, False))
+
+    def test_conflicting_tokens_are_not_confident(self):
+        outcome, ok = s.parse_worker_response("BLOCKED but also COMPLETE somehow")
+        self.assertEqual((outcome, ok), (None, False))
+
+    def test_review_pass_plus_complete_is_not_a_conflict(self):
+        self.assertEqual(s.parse_worker_response("REVIEW_PASS — the work is COMPLETE"),
+                         ("REVIEW_PASS", True))
+
+
+class TestHandoffPrompts(Base):
+    def _build(self, **over):
+        kw = dict(buildName="Test build", projectName="Decision Deck",
+                  repoPath="/home/chris/x", userGoal="Make the deck shuffle",
+                  mode="fix", workerSequence="builder_council_reviewer",
+                  safetyRails=list(s.HANDOFF_RAILS))
+        kw.update(over)
+        return s.HandoffBuildStore().create(**kw)
+
+    def test_builder_prompt_contains_every_required_element(self):
+        b = self._build()
+        p = s.build_handoff_prompt(b, "builder", "claude")
+        for expected in ("Decision Deck", "/home/chris/x", "Make the deck shuffle",
+                         "fix", "BUILDER", "Claude", "SAFETY RAILS",
+                         "WHAT WAS INSPECTED:", "TESTS RUN:", "BLOCKERS:",
+                         "HUMAN APPROVALS NEEDED:", "FINAL STATUS:", "RESULT:"):
+            self.assertIn(expected, p)
+        for rail in s.HANDOFF_RAILS:
+            self.assertIn(rail, p)
+
+    def test_council_and_reviewer_prompts_have_their_formats(self):
+        b = self._build()
+        c = s.build_handoff_prompt(b, "council", "grok")
+        for expected in ("ASSUMPTIONS CHALLENGED:", "BETTER DIRECTION:",
+                         "WHAT NOT TO BUILD:", "RECOMMENDATION:"):
+            self.assertIn(expected, c)
+        r = s.build_handoff_prompt(b, "reviewer", "chatgpt")
+        for expected in ("PASS/FAIL:", "EVIDENCE:", "MISSED REQUIREMENTS:",
+                         "REGRESSION CONCERNS:", "REVIEW_PASS|REVIEW_FAIL"):
+            self.assertIn(expected, r)
+
+    def test_prompt_embeds_inspection_evidence_and_prior_responses(self):
+        store = s.HandoffBuildStore()
+        b = store.create(buildName="x", projectName="p", userGoal="g", mode="build",
+                        workerSequence="builder_reviewer")
+        store.start(b["id"], inspection={"git_status": "M studio.py", "stack": ["python"]})
+        store.mark_pasted(b["id"])
+        store.save_response(b["id"], BUILDER_OK)
+        b = store.get(b["id"])   # now at reviewer
+        p = s.build_handoff_prompt(b, "reviewer", "chatgpt")
+        self.assertIn("M studio.py", p)
+        self.assertIn("builder (Claude): COMPLETE", p)
+        self.assertIn("WHAT WAS INSPECTED: everything", p)
+
+
+class TestHandoffWorkflow(Base):
+    def _start(self, seq="builder_only", **over):
+        store = s.HandoffBuildStore()
+        b = store.create(buildName="B", projectName="P", userGoal="G",
+                        mode="build", workerSequence=seq, **over)
+        return store, store.start(b["id"])
+
+    def test_create_validates_inputs(self):
+        store = s.HandoffBuildStore()
+        with self.assertRaises(ValueError):
+            store.create(buildName="", projectName="p", userGoal="g",
+                        mode="build", workerSequence="builder_only")
+        with self.assertRaises(ValueError):
+            store.create(buildName="b", projectName="p", userGoal="g",
+                        mode="nope", workerSequence="builder_only")
+        with self.assertRaises(ValueError):
+            store.create(buildName="b", projectName="p", userGoal="g",
+                        mode="build", workerSequence="nope")
+
+    def test_builder_only_happy_path_to_complete(self):
+        store, b = self._start()
+        self.assertEqual(b["status"], "Copy Prompt")
+        self.assertEqual(b["currentStep"]["role"], "builder")
+        self.assertTrue(b["prompts"])
+        store.mark_copied(b["id"]); store.mark_opened(b["id"])
+        b = store.mark_pasted(b["id"])
+        self.assertEqual(b["status"], "Waiting for Response")
+        b = store.save_response(b["id"], BUILDER_OK)
+        self.assertEqual(b["status"], "Complete")
+        self.assertIn("BUILD REPORT", b["finalReport"])
+        events = [t["event"] for t in b["timeline"]]
+        for expected in ("Build created", "Prompt generated", "Prompt copied",
+                         "Worker opened", "Response pasted", "Build complete"):
+            self.assertIn(expected, events)
+
+    def test_builder_reviewer_pass_path(self):
+        store, b = self._start("builder_reviewer")
+        store.mark_pasted(b["id"])
+        b = store.save_response(b["id"], BUILDER_OK)
+        self.assertEqual(b["status"], "Review Needed")
+        self.assertEqual(b["currentStep"]["role"], "reviewer")
+        self.assertEqual(b["currentStep"]["worker"], "chatgpt")
+        store.mark_pasted(b["id"])
+        b = store.save_response(b["id"], REVIEWER_PASS)
+        self.assertEqual(b["status"], "Complete")
+        self.assertIn("Review completed", [t["event"] for t in b["timeline"]])
+
+    def test_review_fail_needs_human_and_back_to_builder_works(self):
+        store, b = self._start("builder_reviewer")
+        store.mark_pasted(b["id"])
+        store.save_response(b["id"], BUILDER_OK)
+        store.mark_pasted(b["id"])
+        b = store.save_response(b["id"], REVIEWER_FAIL)
+        self.assertEqual(b["status"], "Human Decision Needed")
+        d = b["currentStep"]["decision"]
+        self.assertEqual(d["recommended"], "back_to_builder")
+        b = store.decide(b["id"], "back_to_builder")
+        self.assertEqual(b["currentStep"]["role"], "builder")
+        self.assertEqual(b["status"], "Copy Prompt")
+
+    def test_unclear_response_needs_human_with_no_recommendation(self):
+        store, b = self._start()
+        store.mark_pasted(b["id"])
+        b = store.save_response(b["id"], "well, it sort of worked I think")
+        self.assertEqual(b["status"], "Human Decision Needed")
+        self.assertIsNone(b["currentStep"]["decision"]["recommended"])
+        self.assertIn("could not confidently determine",
+                     b["currentStep"]["decision"]["reason"])
+        b = store.decide(b["id"], "mark_complete")
+        self.assertEqual(b["status"], "Complete")
+
+    def test_stop_marks_error_and_final_report_says_stopped(self):
+        store, b = self._start()
+        store.mark_pasted(b["id"])
+        store.save_response(b["id"], "RESULT: BLOCKED")
+        b = store.decide(b["id"], "stop")
+        self.assertEqual(b["status"], "Error")
+        self.assertIn("Stopped by Chris", b["finalReport"])
+
+    def test_illegal_choice_and_wrong_phase_are_refused(self):
+        store, b = self._start()
+        with self.assertRaises(s.IllegalTransition):
+            store.decide(b["id"], "stop")          # not at a decision
+        with self.assertRaises(s.IllegalTransition):
+            store.start(b["id"])                   # already started
+        with self.assertRaises(ValueError):
+            store.save_response(b["id"], "   ")    # empty response refused
+        store.mark_pasted(b["id"])
+        store.save_response(b["id"], BUILDER_OK)   # -> Complete
+        with self.assertRaises(s.IllegalTransition):
+            store.save_response(b["id"], BUILDER_OK)   # finished build refuses more
+
+    def test_set_worker_regenerates_prompt_for_current_role(self):
+        store, b = self._start()
+        before = b["prompts"][-1]["text"]
+        b = store.set_worker(b["id"], "grok")
+        self.assertEqual(b["currentStep"]["worker"], "grok")
+        self.assertIn("Grok", b["prompts"][-1]["text"])
+        self.assertNotEqual(before, b["prompts"][-1]["text"])
+
+    def test_builds_persist_across_reload(self):
+        store, b = self._start()
+        store2 = s.HandoffBuildStore()
+        self.assertEqual(store2.get(b["id"])["buildName"], "B")
+
+
+class TestHandoffHTTP(_HTTPBase):
+    def test_full_build_over_http(self):
+        code, rec = self._req("/api/builds", {"buildName": "HTTP build",
+                                              "projectName": "P", "userGoal": "G",
+                                              "mode": "audit",
+                                              "workerSequence": "builder_only",
+                                              "safetyRails": ["Do not deploy"]})
+        self.assertEqual(code, 201)
+        bid = rec["id"]
+        code, rec = self._req(f"/api/builds/{bid}/start",
+                              {"inspection": {"git_status": "clean"}})
+        self.assertEqual(rec["currentStep"]["phase"], "copy")
+        self.assertIn("clean", rec["currentStep"]["prompt"])
+        self._req(f"/api/builds/{bid}/copied", {})
+        self._req(f"/api/builds/{bid}/pasted", {})
+        code, rec = self._req(f"/api/builds/{bid}/response", {"raw": BUILDER_OK})
+        self.assertEqual(rec["status"], "Complete")
+        code, data = self._req("/api/builds")
+        self.assertEqual(data["builds"][0]["id"], bid)
+
+    def test_handoff_page_serves_html(self):
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/handoff", timeout=5) as r:
+            self.assertEqual(r.status, 200)
+            self.assertIn(b"<html", r.read()[:200].lower())
+
+    def test_bad_decision_choice_is_400_and_wrong_phase_403(self):
+        code, rec = self._req("/api/builds", {"buildName": "b", "projectName": "p",
+                                              "userGoal": "g", "mode": "build",
+                                              "workerSequence": "builder_only"})
+        bid = rec["id"]
+        code, err = self._req(f"/api/builds/{bid}/decision", {"choice": "stop"})
+        self.assertEqual(code, 403)   # not waiting on a decision
+        self._req(f"/api/builds/{bid}/start", {})
+        self._req(f"/api/builds/{bid}/pasted", {})
+        self._req(f"/api/builds/{bid}/response", {"raw": "no tokens here at all"})
+        code, err = self._req(f"/api/builds/{bid}/decision", {"choice": "not_a_choice"})
+        self.assertEqual(code, 400)
 
 
 if __name__ == "__main__":

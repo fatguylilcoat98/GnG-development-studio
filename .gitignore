@@ -9,3 +9,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .DS_Store
+
+# Safe Server Agent local config — server-specific paths, never committed.
+# Copy agent_config.example.json to agent_config.json and edit.
+agent_config.json

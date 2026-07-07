@@ -56,9 +56,26 @@ Tailscale — never an external host. See
 ## Run
 
 ```bash
-python3 studio.py                 # dashboard at http://127.0.0.1:8893/
+python3 studio.py                 # Studio at http://127.0.0.1:8893/
 # or: ./scripts/start.sh
 ```
+
+**Builds (Browser Handoff, v1)** live at `/handoff`: create a build, Studio
+generates every worker prompt (Builder / Council / Reviewer), you copy it into
+claude.ai / chatgpt.com / grok.com / Claude Code, paste the response back, and
+Studio parses the `RESULT:` line to decide the next step — one screen, one
+action, ending in a final report. Optional real server evidence comes from the
+**Safe Server Agent**:
+
+```bash
+cp agent_config.example.json agent_config.json   # edit: approved projects + origins
+python3 agent.py                  # agent at http://127.0.0.1:8894/
+# or: ./scripts/start-agent.sh
+```
+
+The agent only serves approved projects from its config, only runs checks from
+a fixed catalog, refuses secrets/path escapes, and logs everything — see
+[`docs/SAFETY_RAILS.md`](docs/SAFETY_RAILS.md).
 
 Founder report (no server required):
 
@@ -76,9 +93,17 @@ Founder report (no server required):
 
 ```
 studio.py            # stdlib-only server + all core logic (projects, jobs,
-                      # prompts, reports, decisions, risks, notes, planning rooms)
+                      # prompts, reports, decisions, risks, notes, planning
+                      # rooms, handoff builds) — subprocess-free, test-enforced
+agent.py              # Safe Server Agent (port 8894): approved-projects
+                      # inspection + allow-listed checks; the ONLY place a
+                      # command ever runs. Config: agent_config.json
+handoff.html          # /handoff — Browser Handoff builds (v1)
 dashboard.html        # the four-pane UI + Planning Room + Needs Chris panel
-test_studio.py        # full test suite (stdlib unittest)
+guided.html           # / — the guided one-action-at-a-time flow
+outcomes.html         # /outcomes — finished builds with folder/command/URL
+test_studio.py        # studio test suite (stdlib unittest)
+test_agent.py         # agent test suite (refusals, traversal, secrets, CORS)
 scripts/
   start.sh            # python3 studio.py
   founder-report.sh   # writes reports/*.md, appends this repo's OWN git status

@@ -1,0 +1,22 @@
+{
+  "_comment": "Copy this file to agent_config.json (gitignored) and edit. Only projects listed here are reachable through the agent; only the checks listed per project may run. Add your Studio origin(s) to allowed_origins — e.g. your Tailscale address.",
+  "allowed_origins": [
+    "http://127.0.0.1:8893",
+    "http://localhost:8893",
+    "http://100.90.72.114:8893"
+  ],
+  "projects": [
+    {
+      "id": "gng-development-studio",
+      "name": "GNG Development Studio",
+      "path": "/home/chris/GnG-development-studio",
+      "checks": ["python-unittest"]
+    },
+    {
+      "id": "decision-deck",
+      "name": "Decision Deck",
+      "path": "/home/chris/GnG-development-studio/projects/decision-deck/app",
+      "checks": []
+    }
+  ]
+}

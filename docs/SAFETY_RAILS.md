@@ -80,6 +80,31 @@ The guardrails on this one exception:
 command, launches a process, or calls a third-party library. Only the stdlib
 `urllib.request` GET described above is permitted, and only inside the guard.
 
+## The third exception: the Safe Server Agent (`agent.py`)
+
+Command execution exists in exactly one place — a SEPARATE process
+(`agent.py`, port 8894) that the browser talks to directly. `studio.py`
+remains subprocess-free and never imports or calls the agent (both facts are
+test-enforced). The agent's posture is blocked-by-default:
+
+- **Approved projects only** — projects live in `agent_config.json` on the
+  server. The browser can only name a `projectId` from that file; there is no
+  route that accepts a path for execution.
+- **Allow-listed checks only** — `/run-check` accepts a `checkName` that must
+  be in the fixed `CHECK_CATALOG` (npm test/build, pytest, unittest,
+  `docker compose ps`) AND in that project's own `checks` list. Commands are
+  fixed argv tuples, never shell strings, never templated with user input;
+  `shell=True` never appears (test-enforced).
+- **Read-only otherwise** — `/inspect` gathers tree/docs/scripts/git evidence;
+  `/read-file` refuses `.env`/keys/tokens/credentials by name, path escapes by
+  realpath containment, and files over 200KB.
+- **No code path at all** for deploying, restarting services, deleting files,
+  pushing to a remote, or arbitrary shell.
+- **Every request logged** — allowed or refused, with the reason, to
+  `state/agent_log.jsonl`.
+- **CORS allow-list** — the agent only answers browsers whose Origin is
+  listed in `agent_config.json` (`allowed_origins`).
+
 ## Hands-off projects
 
 PathBack, LYLO, Splendor, and CLASPION are seeded `hands_off: true`. In Phase

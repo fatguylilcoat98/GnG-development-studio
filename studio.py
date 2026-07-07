@@ -44,6 +44,7 @@ PROJECTS_DIR = os.path.join(ROOT, "projects")
 DASHBOARD_PATH = os.path.join(ROOT, "dashboard.html")
 GUIDED_PATH = os.path.join(ROOT, "guided.html")
 OUTCOMES_PATH = os.path.join(ROOT, "outcomes.html")
+HANDOFF_PATH = os.path.join(ROOT, "handoff.html")
 
 PROJECTS_PATH = os.path.join(STATE_DIR, "projects.json")
 JOBS_PATH = os.path.join(STATE_DIR, "jobs.jsonl")
@@ -53,6 +54,7 @@ NOTES_PATH = os.path.join(STATE_DIR, "notes.jsonl")
 RISKS_PATH = os.path.join(STATE_DIR, "risks.jsonl")
 ROOMS_PATH = os.path.join(STATE_DIR, "planning_rooms.jsonl")
 STUDIO_STATE_PATH = os.path.join(STATE_DIR, "studio_state.json")
+BUILDS_PATH = os.path.join(STATE_DIR, "builds.jsonl")
 
 PORT = int(os.environ.get("GNG_STUDIO_PORT", "8893"))
 BIND = os.environ.get("GNG_STUDIO_BIND", "127.0.0.1")
@@ -1527,6 +1529,410 @@ def guided_complete(jobs, job_id):
     return job
 
 
+# ── Browser Handoff builds (Development Studio v1) ─────────────────────────────
+# Studio owns the workflow, state, prompts, responses, and final report; the AI
+# websites (claude.ai / chatgpt.com / grok.com) are only external workers Chris
+# copies prompts into and pastes responses back from. No API keys, no direct AI
+# integration — same copy/paste posture as the rest of Studio, but organized as
+# BUILDS: goal in, one next-action at a time, final report out. Optional
+# server evidence comes from the separate Safe Server Agent (agent.py), which
+# the BROWSER talks to — studio.py itself never runs a command.
+WORKERS = {
+    "claude": {"name": "Claude", "url": "https://claude.ai"},
+    "chatgpt": {"name": "ChatGPT", "url": "https://chatgpt.com"},
+    "grok": {"name": "Grok", "url": "https://grok.com"},
+    "claude_code": {"name": "Claude Code", "url": None},   # runs in Chris's terminal, no URL
+}
+BUILD_MODES = ("audit", "fix", "build", "review")
+WORKER_SEQUENCES = {
+    "builder_only": ("builder",),
+    "builder_reviewer": ("builder", "reviewer"),
+    "builder_council_reviewer": ("builder", "council", "reviewer"),
+}
+DEFAULT_ROLE_WORKERS = {"builder": "claude", "council": "grok", "reviewer": "chatgpt"}
+BUILD_STATUSES = ("Draft", "Copy Prompt", "Waiting for Response",
+                  "Human Decision Needed", "Review Needed", "Complete", "Error")
+HANDOFF_RAILS = ("Do not deploy", "Do not delete originals", "Do not touch secrets",
+                 "Do not restart services", "Do not change unrelated projects",
+                 "Ask before risky actions")
+RESPONSE_OUTCOMES = ("COMPLETE", "BLOCKED", "HUMAN_DECISION_REQUIRED",
+                     "TESTS_FAILED", "REVIEW_PASS", "REVIEW_FAIL")
+
+
+def parse_worker_response(raw):
+    """v1 parser: don't try to perfectly understand every response. Every
+    generated prompt asks the worker to end with a 'RESULT: <TOKEN>' line;
+    that line wins. Fallback: exactly one bare token somewhere in the text
+    (spaces tolerated in place of underscores). Anything else — zero tokens,
+    or several conflicting ones — is (None, False): not confident, so the
+    build lands at Human Decision Needed instead of guessing."""
+    up = str(raw or "").upper()
+    m = None
+    for m in re.finditer(r"^\s*RESULT:\s*([A-Z_ ]+?)\s*$", up, re.MULTILINE):
+        pass   # last RESULT: line wins — workers sometimes quote the format first
+    if m:
+        token = m.group(1).strip().replace(" ", "_")
+        if token in RESPONSE_OUTCOMES:
+            return token, True
+    found = []
+    for token in RESPONSE_OUTCOMES:
+        if re.search(r"\b" + token.replace("_", "[_ ]") + r"\b", up):
+            found.append(token)
+    if found == ["COMPLETE"] or (len(found) == 1):
+        return found[0], True
+    if set(found) == {"REVIEW_PASS", "COMPLETE"}:
+        return "REVIEW_PASS", True   # "review passed, work is complete" — not a conflict
+    return None, False
+
+
+def _handoff_evidence_block(inspection):
+    if not inspection:
+        return "(no server inspection on file — inspect the project yourself before changing it)"
+    out = []
+    for k, v in list(inspection.items())[:14]:
+        s = v if isinstance(v, str) else json.dumps(v)
+        out.append(f"- {k}: {s[:600]}")
+    return "\n".join(out) or "(inspection returned nothing)"
+
+
+def _handoff_prior_steps_block(build):
+    if not build["responses"]:
+        return "This is the first worker step; there are no prior responses."
+    lines = ["Steps completed so far:"]
+    for r in build["responses"]:
+        lines.append(f"- {r['role']} ({WORKERS[r['worker']]['name']}): {r['outcome'] or 'unclear'}")
+    last = build["responses"][-1]
+    lines.append(f"\nMost recent worker output ({last['role']}), for your context:\n"
+                f"{last['raw'][:1500]}")
+    return "\n".join(lines)
+
+
+_HANDOFF_ROLE_TASKS = {
+    "builder": """YOUR TASK (Builder)
+Perform the {mode} task described in the goal above, inside the repo path
+given. Inspect before changing. Run the project's tests if any exist. Stay
+inside this project only.
+
+REQUIRED OUTPUT FORMAT — reply with exactly these labeled sections:
+WHAT WAS INSPECTED: <files/areas you actually looked at>
+WHAT WAS CHANGED: <files changed, or none>
+TESTS RUN: <what you ran and pass/fail, or none available>
+BLOCKERS: <none | description>
+HUMAN APPROVALS NEEDED: <none | what Chris must decide>
+FINAL STATUS: <one sentence>
+RESULT: <COMPLETE|BLOCKED|TESTS_FAILED|HUMAN_DECISION_REQUIRED>""",
+    "council": """YOUR TASK (Council)
+Do NOT do the build. Challenge it. Attack the plan and product direction the
+prior steps imply: what is being assumed, what could go wrong, what should
+not be built at all, what a better direction would be.
+
+REQUIRED OUTPUT FORMAT — reply with exactly these labeled sections:
+ASSUMPTIONS CHALLENGED: <list>
+RISKS: <list>
+BETTER DIRECTION: <or "none — current direction is right">
+WHAT NOT TO BUILD: <list or none>
+RECOMMENDATION: <one paragraph>
+RESULT: <COMPLETE|HUMAN_DECISION_REQUIRED>
+(Use COMPLETE if the direction is sound enough to proceed; use
+HUMAN_DECISION_REQUIRED if Chris must choose between real alternatives.)""",
+    "reviewer": """YOUR TASK (Reviewer)
+Independently review the Builder's result above. Do not trust its claims —
+check them against the goal and the evidence. Look for missed requirements
+and regression risk.
+
+REQUIRED OUTPUT FORMAT — reply with exactly these labeled sections:
+PASS/FAIL: <pass | fail>
+EVIDENCE: <what you verified and how>
+RISKS: <list or none>
+MISSED REQUIREMENTS: <list or none>
+REGRESSION CONCERNS: <list or none>
+FINAL RECOMMENDATION: <one paragraph>
+RESULT: <REVIEW_PASS|REVIEW_FAIL|HUMAN_DECISION_REQUIRED>""",
+}
+
+
+def build_handoff_prompt(build, role, worker):
+    rails = "\n".join(f"- {r}" for r in build["safetyRails"]) or "- (none selected)"
+    task = _HANDOFF_ROLE_TASKS[role].format(mode=build["mode"])
+    return f"""You are the {role.upper()} in a GNG Development Studio build. You are
+{WORKERS[worker]['name']}, working as an external worker: Studio owns the workflow
+and state; you do one step and report back in the exact format below.
+
+BUILD: {build['buildName']}
+PROJECT: {build['projectName']}
+REPO PATH: {build['repoPath'] or '(not set)'}
+MODE: {build['mode']}
+GOAL: {build['userGoal']}
+
+CURRENT BUILD STATE
+{_handoff_prior_steps_block(build)}
+
+EVIDENCE FROM SERVER INSPECTION
+{_handoff_evidence_block(build.get('inspection'))}
+
+SAFETY RAILS (non-negotiable)
+{rails}
+
+{task}
+
+The final line of your reply MUST be the RESULT: line, alone, exactly as
+specified — Studio parses it to decide the next step."""
+
+
+def _handoff_decision_for(outcome, confident, role):
+    base_choices = ["retry_step", "continue_next", "mark_complete", "stop"]
+    if not confident:
+        return {"reason": "Studio could not confidently determine the result. "
+                          "Please choose what happened.",
+                "recommended": None,
+                "risks": "Guessing wrong here can mark unfinished work complete, "
+                         "or redo work that is already done.",
+                "choices": base_choices, "outcome": None}
+    if outcome == "BLOCKED":
+        return {"reason": f"The {role} reported BLOCKED — it could not finish without "
+                          "something it doesn't have.",
+                "recommended": "retry_step",
+                "risks": "Continuing past a blocker usually produces a broken result.",
+                "choices": base_choices, "outcome": outcome}
+    if outcome == "TESTS_FAILED":
+        return {"reason": f"The {role} reported TESTS_FAILED.",
+                "recommended": "retry_step",
+                "risks": "Marking this complete would ship failing code.",
+                "choices": base_choices, "outcome": outcome}
+    if outcome == "REVIEW_FAIL":
+        return {"reason": "The reviewer failed this build.",
+                "recommended": "back_to_builder",
+                "risks": "Completing anyway ignores an independent reviewer's fail verdict.",
+                "choices": ["back_to_builder"] + base_choices, "outcome": outcome}
+    # HUMAN_DECISION_REQUIRED — the worker explicitly asked for Chris
+    return {"reason": f"The {role} explicitly asked for a human decision — read its "
+                      "response above before choosing.",
+            "recommended": None,
+            "risks": "The worker flagged something it wasn't willing to decide alone.",
+            "choices": base_choices, "outcome": outcome}
+
+
+class HandoffBuildStore:
+    """Builds for Browser Handoff Mode. Same append-only JSONL, last-write-wins
+    pattern as every other Studio store."""
+
+    def __init__(self):
+        self.builds = _jsonl_load_index(BUILDS_PATH)
+
+    def _save(self, rec):
+        rec["updatedAt"] = time.time()
+        self.builds[rec["id"]] = rec
+        _jsonl_append(BUILDS_PATH, rec)
+        return rec
+
+    def get(self, bid):
+        b = self.builds.get(bid)
+        if b is None:
+            raise NotFound(f"unknown build: {bid}")
+        return b
+
+    def list(self):
+        return sorted(self.builds.values(), key=lambda b: b["createdAt"], reverse=True)
+
+    def _log(self, rec, event, detail=""):
+        rec["timeline"] = rec["timeline"] + [{"event": event, "detail": detail, "at": _now()}]
+
+    def create(self, buildName, projectName, userGoal, mode, workerSequence,
+              repoPath="", safetyRails=None, serverProjectId=""):
+        buildName, userGoal = str(buildName).strip(), str(userGoal).strip()
+        if not buildName:
+            raise ValueError("build name is required")
+        if not userGoal:
+            raise ValueError("describe what you want done")
+        if mode not in BUILD_MODES:
+            raise ValueError(f"mode must be one of {BUILD_MODES}")
+        if workerSequence not in WORKER_SEQUENCES:
+            raise ValueError(f"worker sequence must be one of {tuple(WORKER_SEQUENCES)}")
+        rails = [r for r in (safetyRails or []) if r in HANDOFF_RAILS]
+        rec = {"id": _id(), "buildName": buildName,
+              "projectName": str(projectName).strip() or buildName,
+              "repoPath": str(repoPath).strip(), "userGoal": userGoal,
+              "mode": mode, "workerSequence": workerSequence, "safetyRails": rails,
+              "serverProjectId": str(serverProjectId).strip(),
+              "status": "Draft",
+              "currentStep": {"roleIndex": 0, "role": None, "phase": "draft",
+                              "worker": None, "decision": None},
+              "prompts": [], "responses": [], "timeline": [], "inspection": None,
+              "finalReport": None,
+              "createdAt": time.time(), "updatedAt": time.time()}
+        self._log(rec, "Build created")
+        return self._save(rec)
+
+    # ── internal step machinery ────────────────────────────────────────────
+    def _roles(self, rec):
+        return list(WORKER_SEQUENCES[rec["workerSequence"]])
+
+    def _status_for(self, role, phase):
+        if role == "reviewer":
+            return "Review Needed"
+        return "Copy Prompt" if phase == "copy" else "Waiting for Response"
+
+    def _generate_prompt(self, rec, role, worker=None):
+        worker = worker or DEFAULT_ROLE_WORKERS[role]
+        text = build_handoff_prompt(rec, role, worker)
+        rec["prompts"] = rec["prompts"] + [{"role": role, "worker": worker,
+                                            "text": text, "created_at": _now()}]
+        rec["currentStep"] = {"roleIndex": self._roles(rec).index(role), "role": role,
+                              "phase": "copy", "worker": worker, "decision": None}
+        rec["status"] = self._status_for(role, "copy")
+        self._log(rec, "Prompt generated", f"{role} ({WORKERS[worker]['name']})")
+
+    def _advance(self, rec):
+        roles = self._roles(rec)
+        nxt = rec["currentStep"]["roleIndex"] + 1
+        if nxt < len(roles):
+            self._log(rec, "Next step chosen", roles[nxt])
+            self._generate_prompt(rec, roles[nxt])
+        else:
+            self._complete(rec)
+
+    def _complete(self, rec):
+        rec["status"] = "Complete"
+        rec["currentStep"] = dict(rec["currentStep"], phase="done", decision=None)
+        rec["finalReport"] = build_handoff_final_report(rec)
+        self._log(rec, "Build complete")
+
+    def _human(self, rec, outcome, confident):
+        role = rec["currentStep"]["role"]
+        decision = _handoff_decision_for(outcome, confident, role)
+        rec["status"] = "Human Decision Needed"
+        rec["currentStep"] = dict(rec["currentStep"], phase="human", decision=decision)
+        self._log(rec, "Human decision needed", decision["reason"])
+
+    # ── actions (one per UI button) ────────────────────────────────────────
+    def start(self, bid, inspection=None):
+        rec = dict(self.get(bid))
+        if rec["status"] != "Draft":
+            raise IllegalTransition("this build has already been started")
+        if inspection:
+            rec["inspection"] = inspection
+            self._log(rec, "Project inspected",
+                     f"{len(inspection)} evidence fields from the Safe Server Agent")
+        self._generate_prompt(rec, self._roles(rec)[0])
+        return self._save(rec)
+
+    def set_worker(self, bid, worker):
+        rec = dict(self.get(bid))
+        if worker not in WORKERS:
+            raise ValueError(f"worker must be one of {tuple(WORKERS)}")
+        if rec["currentStep"]["phase"] != "copy":
+            raise IllegalTransition("worker can only be changed while the prompt is being copied")
+        self._generate_prompt(rec, rec["currentStep"]["role"], worker)
+        return self._save(rec)
+
+    def mark_copied(self, bid):
+        rec = dict(self.get(bid))
+        self._log(rec, "Prompt copied")
+        return self._save(rec)
+
+    def mark_opened(self, bid):
+        rec = dict(self.get(bid))
+        self._log(rec, "Worker opened", WORKERS[rec["currentStep"]["worker"]]["name"])
+        return self._save(rec)
+
+    def mark_pasted(self, bid):
+        rec = dict(self.get(bid))
+        if rec["currentStep"]["phase"] != "copy":
+            raise IllegalTransition("there is no prompt waiting to be pasted")
+        rec["currentStep"] = dict(rec["currentStep"], phase="paste")
+        rec["status"] = self._status_for(rec["currentStep"]["role"], "paste")
+        return self._save(rec)
+
+    def save_response(self, bid, raw):
+        rec = dict(self.get(bid))
+        if rec["currentStep"]["phase"] not in ("copy", "paste"):
+            raise IllegalTransition("this build is not waiting on a worker response")
+        raw = str(raw or "").strip()
+        if not raw:
+            raise ValueError("paste the worker's response first")
+        outcome, confident = parse_worker_response(raw)
+        role, worker = rec["currentStep"]["role"], rec["currentStep"]["worker"]
+        rec["responses"] = rec["responses"] + [{"role": role, "worker": worker,
+                                                "raw": raw, "outcome": outcome,
+                                                "confident": confident,
+                                                "created_at": _now()}]
+        self._log(rec, "Response pasted", f"{role}: {outcome or 'unclear'}")
+        if confident and outcome in ("COMPLETE", "REVIEW_PASS"):
+            if role == "reviewer":
+                self._log(rec, "Review completed", outcome)
+            self._advance(rec)
+        else:
+            self._human(rec, outcome, confident)
+        return self._save(rec)
+
+    def decide(self, bid, choice):
+        rec = dict(self.get(bid))
+        decision = rec["currentStep"].get("decision")
+        if rec["currentStep"]["phase"] != "human" or not decision:
+            raise IllegalTransition("this build is not waiting on a human decision")
+        if choice not in decision["choices"]:
+            raise ValueError(f"choice must be one of {decision['choices']}")
+        role = rec["currentStep"]["role"]
+        self._log(rec, "Next step chosen", f"Chris chose: {choice}")
+        if choice == "retry_step":
+            self._generate_prompt(rec, role, rec["currentStep"]["worker"])
+        elif choice == "back_to_builder":
+            self._generate_prompt(rec, self._roles(rec)[0])
+        elif choice == "continue_next":
+            self._advance(rec)
+        elif choice == "mark_complete":
+            self._complete(rec)
+        elif choice == "stop":
+            rec["status"] = "Error"
+            rec["currentStep"] = dict(rec["currentStep"], phase="done", decision=None)
+            rec["finalReport"] = build_handoff_final_report(rec, stopped=True)
+            self._log(rec, "Build stopped", "stopped by Chris")
+        return self._save(rec)
+
+    def note(self, bid, event, detail=""):
+        """Timeline entry from the UI — e.g. a Safe Server Agent check the
+        browser ran. Text only; Studio executes nothing."""
+        rec = dict(self.get(bid))
+        self._log(rec, str(event)[:80] or "Note", str(detail)[:400])
+        return self._save(rec)
+
+
+def build_handoff_final_report(build, stopped=False):
+    lines = [f"BUILD REPORT — {build['buildName']}",
+             f"Project: {build['projectName']} ({build['repoPath'] or 'no repo path'})",
+             f"Goal: {build['userGoal']}",
+             f"Mode: {build['mode']}   Sequence: {build['workerSequence']}",
+             f"Status: {'Stopped by Chris' if stopped else 'Complete'}", "", "STEPS:"]
+    for r in build["responses"]:
+        lines.append(f"- {r['role']} ({WORKERS[r['worker']]['name']}): {r['outcome'] or 'unclear'}")
+    if not build["responses"]:
+        lines.append("- (no worker responses were recorded)")
+    lines += ["", f"Timeline: {len(build['timeline'])} events",
+              "", "NEXT RECOMMENDED STEP:"]
+    if stopped:
+        lines.append("Review why this was stopped, then start a fresh build when ready.")
+    else:
+        lines.append("Open the repo and confirm the result yourself (run the app/tests) "
+                     "before treating this as shipped.")
+    return "\n".join(lines)
+
+
+def handoff_build_view(build):
+    """The build record plus everything the UI needs to render one screen:
+    worker display name/URL for the current step and the latest prompt text."""
+    v = dict(build)
+    step = dict(build["currentStep"])
+    role, worker = step.get("role"), step.get("worker")
+    if worker:
+        step["workerName"] = WORKERS[worker]["name"]
+        step["workerUrl"] = WORKERS[worker]["url"]
+    step["prompt"] = next((p["text"] for p in reversed(build["prompts"])
+                          if p["role"] == role), None)
+    v["currentStep"] = step
+    v["workers"] = WORKERS
+    return v
+
+
 def list_outcomes(projects, jobs, reports):
     """Every finished build across all projects, for the 'Built Projects /
     Outcomes' page — anything that has cleared the approval gate (or never
@@ -2211,6 +2617,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/outcomes":
                 return self._send(200, {"outcomes": list_outcomes(self.projects, self.jobs,
                                                                    self.reports)})
+            if path == "/api/builds":
+                return self._send(200, {"builds": [handoff_build_view(b)
+                                                   for b in self.builds.list()]})
+            m = re.match(rf"^/api/builds/({_UUID_RE})$", path)
+            if m:
+                return self._send(200, handoff_build_view(self.builds.get(m.group(1))))
             m = re.match(rf"^/api/project/({_PID_RE})/timeline$", path)
             if m:
                 get_project(self.projects, m.group(1))
@@ -2275,6 +2687,12 @@ class Handler(BaseHTTPRequestHandler):
                         return self._send(200, f.read(), "text/html; charset=utf-8")
                 except OSError:
                     return self._send(404, {"error": "outcomes page missing"})
+            if path in ("/handoff", "/handoff.html", "/builds"):
+                try:
+                    with open(HANDOFF_PATH, "rb") as f:
+                        return self._send(200, f.read(), "text/html; charset=utf-8")
+                except OSError:
+                    return self._send(404, {"error": "handoff page missing"})
             return self._send(404, {"error": "not found"})
         except NotFound as e:
             return self._send(404, {"error": str(e)})
@@ -2612,6 +3030,53 @@ class Handler(BaseHTTPRequestHandler):
                                               manual=overrides)
                 return self._send(200, build_outcome(job, project, rec))
 
+            # ── Browser Handoff builds ──────────────────────────────────────
+            if path == "/api/builds":
+                b = self._body()
+                rec = self.builds.create(buildName=b.get("buildName", ""),
+                                         projectName=b.get("projectName", ""),
+                                         repoPath=b.get("repoPath", ""),
+                                         userGoal=b.get("userGoal", ""),
+                                         mode=b.get("mode", "build"),
+                                         workerSequence=b.get("workerSequence", "builder_only"),
+                                         safetyRails=b.get("safetyRails"),
+                                         serverProjectId=b.get("serverProjectId", ""))
+                return self._send(201, handoff_build_view(rec))
+            m = re.match(rf"^/api/builds/({_UUID_RE})/start$", path)
+            if m:
+                b = self._body()
+                inspection = b.get("inspection")
+                if inspection is not None and not isinstance(inspection, dict):
+                    return self._send(400, {"error": "inspection must be an object"})
+                rec = self.builds.start(m.group(1), inspection=inspection)
+                return self._send(200, handoff_build_view(rec))
+            m = re.match(rf"^/api/builds/({_UUID_RE})/worker$", path)
+            if m:
+                rec = self.builds.set_worker(m.group(1), self._body().get("worker", ""))
+                return self._send(200, handoff_build_view(rec))
+            m = re.match(rf"^/api/builds/({_UUID_RE})/copied$", path)
+            if m:
+                return self._send(200, handoff_build_view(self.builds.mark_copied(m.group(1))))
+            m = re.match(rf"^/api/builds/({_UUID_RE})/opened$", path)
+            if m:
+                return self._send(200, handoff_build_view(self.builds.mark_opened(m.group(1))))
+            m = re.match(rf"^/api/builds/({_UUID_RE})/pasted$", path)
+            if m:
+                return self._send(200, handoff_build_view(self.builds.mark_pasted(m.group(1))))
+            m = re.match(rf"^/api/builds/({_UUID_RE})/response$", path)
+            if m:
+                rec = self.builds.save_response(m.group(1), self._body().get("raw", ""))
+                return self._send(200, handoff_build_view(rec))
+            m = re.match(rf"^/api/builds/({_UUID_RE})/decision$", path)
+            if m:
+                rec = self.builds.decide(m.group(1), self._body().get("choice", ""))
+                return self._send(200, handoff_build_view(rec))
+            m = re.match(rf"^/api/builds/({_UUID_RE})/note$", path)
+            if m:
+                b = self._body()
+                rec = self.builds.note(m.group(1), b.get("event", ""), b.get("detail", ""))
+                return self._send(200, handoff_build_view(rec))
+
             return self._send(404, {"error": "not found"})
         except NotFound as e:
             return self._send(404, {"error": str(e)})
@@ -2632,6 +3097,7 @@ def build_app_state():
     risks = RiskStore(projects)
     notes = NoteStore(projects)
     rooms = PlanningRoomStore(projects, jobs, notes)
+    builds = HandoffBuildStore()
     Handler.projects = projects
     Handler.jobs = jobs
     Handler.reports = reports
@@ -2639,6 +3105,7 @@ def build_app_state():
     Handler.risks = risks
     Handler.notes = notes
     Handler.rooms = rooms
+    Handler.builds = builds
     return projects, jobs, reports, decisions, risks, notes, rooms
 
 
