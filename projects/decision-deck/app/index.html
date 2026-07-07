@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Decision Deck — think through an important decision with structured cards. It never tells you what to choose." />
+  <title>Decision Deck</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="app" id="app">
+    <!-- Progress indicator -->
+    <header class="topbar" id="topbar" hidden>
+      <div class="brand">Decision Deck</div>
+      <div class="progress" aria-hidden="true">
+        <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+        <div class="progress-label" id="progressLabel">Step 1 of 6</div>
+      </div>
+      <div class="save-state" id="saveState" aria-live="polite">Saved</div>
+    </header>
+
+    <section class="card-viewport" id="cardViewport" aria-live="polite">
+      <!-- Cards are rendered here by app.js -->
+    </section>
+  </main>
+
+  <!-- Card templates -->
+  <template id="tpl-welcome">
+    <article class="card card-welcome">
+      <h1 class="card-title">Decision Deck</h1>
+      <p class="lede">A calm, private space to think through one important decision.</p>
+      <p class="helper">
+        This deck walks you through your situation, options, pros and cons, risks,
+        and a note to your future self &mdash; then hands you a clean one-page summary.
+        It will <strong>never</strong> tell you what to choose. That part is always yours.
+      </p>
+      <label class="field">
+        <span class="field-label">What decision are you facing? <span class="muted">(optional)</span></span>
+        <input type="text" id="input-title" class="text-input" placeholder="e.g. Should I take the new job?" maxlength="140" autocomplete="off" />
+      </label>
+      <div class="card-actions">
+        <button class="btn btn-primary" data-action="start">Start</button>
+      </div>
+      <p class="privacy-note">Everything stays on this device, in your browser. Nothing is uploaded.</p>
+    </article>
+  </template>
+
+  <template id="tpl-situation">
+    <article class="card">
+      <h2 class="card-title">The situation</h2>
+      <p class="helper">Describe what's going on in your own words. What's prompting this decision, and what's at stake?</p>
+      <label class="field">
+        <span class="field-label">Your situation</span>
+        <textarea id="input-situation" class="text-area" rows="7" placeholder="Right now I'm&hellip;"></textarea>
+      </label>
+    </article>
+  </template>
+
+  <template id="tpl-options">
+    <article class="card">
+      <h2 class="card-title">Your options</h2>
+      <p class="helper">List the paths you could realistically take. Include the &ldquo;do nothing&rdquo; option if it's on the table.</p>
+      <div class="list-editor" data-list="options" data-placeholder="e.g. Accept the offer" data-add-label="Add option"></div>
+    </article>
+  </template>
+
+  <template id="tpl-proscons">
+    <article class="card">
+      <h2 class="card-title">Pros &amp; cons</h2>
+      <p class="helper">Weigh what pulls you toward this decision and what holds you back.</p>
+      <div class="proscons-grid">
+        <div class="proscons-col">
+          <h3 class="col-title col-pros">Pros</h3>
+          <div class="list-editor" data-list="pros" data-placeholder="Something in favor" data-add-label="Add pro"></div>
+        </div>
+        <div class="proscons-col">
+          <h3 class="col-title col-cons">Cons</h3>
+          <div class="list-editor" data-list="cons" data-placeholder="Something against" data-add-label="Add con"></div>
+        </div>
+      </div>
+    </article>
+  </template>
+
+  <template id="tpl-risks">
+    <article class="card">
+      <h2 class="card-title">Risks</h2>
+      <p class="helper">What could go wrong? Naming a risk doesn't make it likely &mdash; it just makes it visible.</p>
+      <div class="list-editor" data-list="risks" data-placeholder="e.g. The role might not be what I expect" data-add-label="Add risk"></div>
+    </article>
+  </template>
+
+  <template id="tpl-future">
+    <article class="card">
+      <h2 class="card-title">Future you</h2>
+      <p class="helper">Step forward in time and look back. This is where clarity usually shows up.</p>
+      <label class="field">
+        <span class="field-label">A year from now, which choice would future-you thank you for &mdash; and why?</span>
+        <textarea id="input-futureYou" class="text-area" rows="4" placeholder="Looking back, I think&hellip;"></textarea>
+      </label>
+      <label class="field">
+        <span class="field-label">What do you already know for sure?</span>
+        <textarea id="input-knowNow" class="text-area" rows="3" placeholder="I'm certain that&hellip;"></textarea>
+      </label>
+      <label class="field">
+        <span class="field-label">What do you still need to learn before deciding?</span>
+        <textarea id="input-needToLearn" class="text-area" rows="3" placeholder="I still need to find out&hellip;"></textarea>
+      </label>
+    </article>
+  </template>
+
+  <template id="tpl-summary">
+    <article class="card card-summary">
+      <h2 class="card-title">Your one-page summary</h2>
+      <p class="helper">Here's everything you worked through, in one place. The choice is yours &mdash; this is just your thinking, made clear.</p>
+      <div class="summary-sheet" id="summarySheet"><!-- rendered --></div>
+      <div class="card-actions summary-actions">
+        <button class="btn btn-primary" data-action="copy">Copy summary</button>
+        <button class="btn btn-secondary" data-action="download">Download markdown</button>
+        <button class="btn btn-ghost" data-action="new">Start a new decision</button>
+      </div>
+    </article>
+  </template>
+
+  <!-- Persistent bottom navigation for steps -->
+  <nav class="navbar" id="navbar" hidden>
+    <button class="btn btn-secondary" id="btnBack">Back</button>
+    <button class="btn btn-primary" id="btnNext">Next</button>
+  </nav>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+  <script src="summary.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
