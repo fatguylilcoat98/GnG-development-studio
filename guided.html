@@ -44,6 +44,8 @@
   .intervention{border:2px solid var(--warn);border-radius:12px;padding:20px;background:#221a08}
   .intervention h2{color:var(--warn)}
   .intervention .what{font-weight:700;font-size:16px;margin-bottom:6px}
+  .file-warning{border:2px solid var(--bad);border-radius:12px;padding:16px;background:#2a1414;margin-bottom:14px}
+  .file-warning .what{font-weight:700;color:var(--bad);margin-bottom:4px}
   pre.copyblock{background:#0d1426;border:1px solid var(--line);border-radius:8px;padding:14px;
        white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:13px;
        max-height:320px;overflow:auto;margin:10px 0}
@@ -402,7 +404,11 @@ function outcomeCard(o){
   const openBtn=o.test_url
     ? `<a class="open-btn" href="${esc(o.test_url)}" target="_blank" rel="noopener">Open →</a>`
     : '';
-  return `<div class="kv" style="margin-top:0">
+  const fc=o.file_check;
+  const warning=fc&&fc.warning
+    ? `<div class="file-warning"><div class="what">⚠ Not verified on disk</div>${esc(fc.warning)}</div>`
+    : '';
+  return `${warning}<div class="kv" style="margin-top:0">
       <b>Project</b><span>${esc(o.project_name)}</span>
       <b>Status</b><span>${esc(o.status||'unknown')}</span>
       <b>Folder</b><span><code>${esc(o.folder||'(not recorded)')}</code></span>

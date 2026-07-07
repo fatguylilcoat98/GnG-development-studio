@@ -763,6 +763,51 @@ class ReportStore:
         return rec
 
 
+def verify_outcome_files(folder, files_changed):
+    """Catch the Decision Deck failure mode on disk, not just trust the report:
+    a build was marked Complete, but the recorded folder was empty, missing,
+    or was actually Studio's OWN per-project bookkeeping directory
+    (projects/<slug>/ — ARCHITECTURE.md, CLAUDE/, REPORTS/, ... — auto-created
+    for every registered project by ensure_project_folder, never application
+    code) rather than wherever the real app was supposed to be written. Runs
+    wherever studio.py actually executes, so this checks the real filesystem
+    Studio is running on."""
+    result = {"folder_exists": False, "is_studio_metadata_folder": False,
+             "missing_files": [], "checked_files": [], "warning": None}
+    if not folder:
+        result["warning"] = "No folder recorded yet — cannot verify the build exists on disk."
+        return result
+    expanded = os.path.expanduser(str(folder))
+    real = os.path.realpath(expanded)
+    real_projects_dir = os.path.realpath(PROJECTS_DIR)
+    if real == real_projects_dir or real.startswith(real_projects_dir + os.sep):
+        result["is_studio_metadata_folder"] = True
+        result["warning"] = ("This folder is Studio's own project bookkeeping directory "
+                             "(ARCHITECTURE.md, CLAUDE/, REPORTS/, ...), not application "
+                             "code. The real build folder was never recorded correctly — "
+                             "edit this outcome with where the app actually lives.")
+        return result
+    if not os.path.isdir(expanded):
+        result["warning"] = f"Folder does not exist on this server: {folder}"
+        return result
+    result["folder_exists"] = True
+    names = [n.strip() for n in re.split(r"[,\n]", files_changed or "") if n.strip()]
+    missing = []
+    for name in names:
+        if len(name) > 80 or " " in name.strip("."):
+            continue   # prose ("several files across the frontend"), not a real filename
+        result["checked_files"].append(name)
+        if not os.path.exists(os.path.join(expanded, name)):
+            missing.append(name)
+    result["missing_files"] = missing
+    if result["checked_files"] and len(missing) == len(result["checked_files"]):
+        result["warning"] = (f"None of the files this report claims changed "
+                             f"({', '.join(missing)}) exist in {folder}.")
+    elif missing:
+        result["warning"] = f"Some claimed files are missing from {folder}: {', '.join(missing)}"
+    return result
+
+
 def build_outcome(job, project, report):
     """The 'Finished Outcome' record for one job: where it lives, how to see it
     running, and what's left. Folder/test command/test URL come from the
@@ -770,10 +815,12 @@ def build_outcome(job, project, report):
     project's registered repo_path otherwise. Chris can always correct any of
     these afterward (ReportStore.amend) — this is exactly the gap Decision
     Deck exposed: the build finished but nothing recorded or showed where it
-    actually landed."""
+    actually landed. file_check verifies the claim against the real
+    filesystem instead of trusting it blindly."""
     folder = (report.get("folder") if report else None) or project.get("repo_path") or ""
     test_command = (report.get("test_command") if report else None) or ""
     test_url = (report.get("test_url") if report else None) or ""
+    files_changed = (report.get("files_changed") if report else None) or ""
     if test_url:
         open_instruction = f"Open {test_url} in your browser."
     elif folder:
@@ -785,11 +832,12 @@ def build_outcome(job, project, report):
         "job_status": job["status"],
         "status": (report.get("status") if report else None) or job["status"],
         "folder": folder, "test_command": test_command, "test_url": test_url,
-        "files_changed": (report.get("files_changed") if report else None) or "",
+        "files_changed": files_changed,
         "notes": (report.get("blockers") if report else None) or "",
         "report_id": report["id"] if report else None,
         "open_instruction": open_instruction,
         "completed_at": report["created_at"] if report else job["updated_at"],
+        "file_check": verify_outcome_files(folder, files_changed),
     }
 
 

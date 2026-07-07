@@ -1496,6 +1496,67 @@ class TestBuildOutcome(Base):
         self.assertEqual(outcome["test_url"], "")
 
 
+class TestVerifyOutcomeFiles(Base):
+    def test_empty_folder_warns(self):
+        result = s.verify_outcome_files("", "index.html")
+        self.assertIn("No folder recorded", result["warning"])
+
+    def test_studio_metadata_folder_is_flagged(self):
+        """The exact Decision Deck failure: the recorded folder resolves to
+        Studio's own projects/<slug>/ bookkeeping directory, not app code."""
+        folder = os.path.join(s.PROJECTS_DIR, "veracore")
+        result = s.verify_outcome_files(folder, "index.html")
+        self.assertTrue(result["is_studio_metadata_folder"])
+        self.assertIn("bookkeeping directory", result["warning"])
+
+    def test_nonexistent_folder_warns(self):
+        result = s.verify_outcome_files("/no/such/path/anywhere-xyz", "index.html")
+        self.assertIn("does not exist", result["warning"])
+        self.assertFalse(result["folder_exists"])
+
+    def test_existing_folder_with_present_files_has_no_warning(self):
+        folder = tempfile.mkdtemp(dir=self.tmp)
+        open(os.path.join(folder, "index.html"), "w").close()
+        open(os.path.join(folder, "app.js"), "w").close()
+        result = s.verify_outcome_files(folder, "index.html, app.js")
+        self.assertIsNone(result["warning"])
+        self.assertTrue(result["folder_exists"])
+        self.assertEqual(result["missing_files"], [])
+
+    def test_existing_folder_missing_claimed_files_warns(self):
+        folder = tempfile.mkdtemp(dir=self.tmp)
+        result = s.verify_outcome_files(folder, "index.html, app.js")
+        self.assertIn("index.html", result["warning"])
+        self.assertEqual(set(result["missing_files"]), {"index.html", "app.js"})
+
+    def test_prose_files_changed_is_not_treated_as_filenames(self):
+        folder = tempfile.mkdtemp(dir=self.tmp)
+        result = s.verify_outcome_files(folder, "several files across the frontend")
+        self.assertIsNone(result["warning"])
+        self.assertEqual(result["checked_files"], [])
+
+
+class TestBuildOutcomeFileCheck(Base):
+    def test_outcome_flags_studio_metadata_folder(self):
+        job = self.make_job(project="veracore")
+        raw = (TestClaudeReportIngestion.GOOD_REPORT +
+              f"\nFOLDER: {os.path.join(s.PROJECTS_DIR, 'veracore')}")
+        rec = self.reports.ingest(job["id"], "veracore", raw)
+        outcome = s.build_outcome(job, self.projects["veracore"], rec)
+        self.assertTrue(outcome["file_check"]["is_studio_metadata_folder"])
+
+    def test_outcome_clean_when_folder_and_files_are_real(self):
+        job = self.make_job(project="veracore")
+        real_folder = tempfile.mkdtemp(dir=self.tmp)
+        open(os.path.join(real_folder, "index.html"), "w").close()
+        raw = (TestClaudeReportIngestion.GOOD_REPORT.replace(
+                  "FILES CHANGED: studio.py, dashboard.html", "FILES CHANGED: index.html")
+              + f"\nFOLDER: {real_folder}")
+        rec = self.reports.ingest(job["id"], "veracore", raw)
+        outcome = s.build_outcome(job, self.projects["veracore"], rec)
+        self.assertIsNone(outcome["file_check"]["warning"])
+
+
 class TestListOutcomes(Base):
     def test_no_finished_jobs_yields_empty_list(self):
         self.make_job(project="veracore")   # stays Draft — not finished
