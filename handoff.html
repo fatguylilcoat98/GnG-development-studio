@@ -49,6 +49,17 @@
   .badge.b-review{background:#241a3a;color:#c9a6ff}
   .badge.b-complete{background:#123626;color:var(--ok)}
   .badge.b-error{background:#3a1414;color:var(--bad)}
+  .intents{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .intent{display:flex;flex-direction:column;align-items:center;gap:8px;
+       background:#0d1426;color:var(--txt);border:1px solid var(--line);border-radius:14px;
+       padding:26px 12px;font-size:34px;min-height:120px}
+  .intent span{font-size:15.5px;font-weight:700}
+  .intent:hover{border-color:var(--accent)}
+  .proj-card{display:flex;align-items:center;gap:12px;background:#0d1426;color:var(--txt);
+       border:1px solid var(--line);border-radius:12px;padding:18px 16px;margin:10px 0;
+       width:100%;font-size:16px;font-weight:700;text-align:left}
+  .proj-card:hover{border-color:var(--accent)}
+  .proj-card small{color:var(--dim);font-weight:400;font-size:12px}
   .build-row{display:flex;justify-content:space-between;gap:10px;align-items:center;
        border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin:8px 0;cursor:pointer}
   .build-row:hover{border-color:var(--accent)}
@@ -82,65 +93,85 @@
     .row button,.row a.open-btn{width:100%;text-align:center}
     .kv{grid-template-columns:1fr}
     .kv b{margin-top:8px}.kv b:first-child{margin-top:0}
+    .intents{grid-template-columns:1fr}
+    .intent{flex-direction:row;justify-content:flex-start;min-height:72px;
+       padding:16px;font-size:26px}
   }
 </style>
 </head>
 <body>
 <header>
-  <h1>Builds</h1>
-  <span class="tag">browser handoff — Studio owns the workflow, AI sites are just workers</span>
+  <h1>GNG Development Studio</h1>
+  <span class="tag">you say what — Studio handles where, how, and who</span>
   <span id="agent-pill" class="agent-pill off" onclick="editAgentUrl()">server: checking…</span>
-  <a class="nav" href="/">← Guided</a>
+  <a class="nav" href="/guided">Guided →</a>
   <a class="nav" href="/outcomes">Outcomes →</a>
 </header>
 <main>
 
-  <!-- HOME -->
+  <!-- HOME: what would you like to do today? -->
   <section id="view-home" class="card">
-    <h2>Your builds</h2>
-    <div class="row" style="margin-top:0;margin-bottom:12px">
-      <button class="big" onclick="openNew()">＋ New Build</button>
+    <h2>What would you like to do today?</h2>
+    <div class="intents">
+      <button class="intent" onclick="chooseIntent('new')">🆕<span>Build Something New</span></button>
+      <button class="intent" onclick="chooseIntent('improve')">🔧<span>Improve Something</span></button>
+      <button class="intent" onclick="chooseIntent('fix')">🐞<span>Fix a Problem</span></button>
+      <button class="intent" onclick="chooseIntent('review')">🔍<span>Review Existing Project</span></button>
     </div>
+    <h2 style="margin-top:26px">Your builds</h2>
     <div id="build-list" class="dim">Loading…</div>
   </section>
 
-  <!-- NEW BUILD -->
-  <section id="view-new" class="card hidden">
+  <!-- PICK: which project? (improve / fix / review) -->
+  <section id="view-pick" class="card hidden">
     <div class="row" style="margin-top:0;margin-bottom:10px">
-      <button class="ghost" onclick="goHome()">← Builds</button>
+      <button class="ghost" onclick="goHome()">← Back</button>
     </div>
-    <h2>New build</h2>
-    <label>Build name</label><input id="n-name" placeholder="e.g. Fix Decision Deck styles">
-
-    <label>Server project</label>
-    <div id="server-project-area">
-      <select id="n-server-project"><option value="">(server not connected)</option></select>
-      <div class="row" style="margin-top:8px">
-        <button class="ghost" onclick="refreshProjects()">Refresh projects</button>
-        <span id="server-status" class="dim" style="font-size:12.5px"></span>
+    <h2 id="pick-title">Which project?</h2>
+    <div id="project-cards" class="dim">Looking for your projects…</div>
+    <div id="pick-fallback" class="hidden">
+      <p class="lead">The server isn't connected, so Studio can't list your projects.
+        You can still continue — just tell it the project's name.</p>
+      <label>Project name</label><input id="pick-manual-name" placeholder="e.g. Decision Deck">
+      <div class="row">
+        <button class="ghost" onclick="loadProjectCards()">Try the server again</button>
+        <button onclick="chooseManualProject()">Continue</button>
       </div>
     </div>
-    <div id="manual-project-area" class="hidden">
-      <label>Project name</label><input id="n-project" placeholder="e.g. Decision Deck">
-      <label>Project folder / repo path</label><input id="n-repo" placeholder="/home/chris/…">
-    </div>
+  </section>
 
-    <label>What do you want done?</label><textarea id="n-goal"></textarea>
-    <label>Mode</label>
-    <select id="n-mode">
-      <option value="audit">Audit</option>
-      <option value="fix">Fix</option>
-      <option value="build" selected>Build</option>
-      <option value="review">Review</option>
-    </select>
-    <label>Worker sequence</label>
-    <select id="n-seq">
-      <option value="builder_only">Builder only</option>
-      <option value="builder_reviewer" selected>Builder + Reviewer</option>
-      <option value="builder_council_reviewer">Builder + Council + Reviewer</option>
-    </select>
-    <label>Safety rails</label>
-    <div id="n-rails"></div>
+  <!-- GOAL: the one question -->
+  <section id="view-goal" class="card hidden">
+    <div class="row" style="margin-top:0;margin-bottom:10px">
+      <button class="ghost" onclick="backFromGoal()">← Back</button>
+      <span class="dim" id="goal-project" style="flex:1;text-align:right"></span>
+    </div>
+    <div id="goal-new-name" class="hidden">
+      <h2>Build something new</h2>
+      <label>Project name</label><input id="g-name" placeholder="e.g. Homework Helper">
+    </div>
+    <h2 id="goal-question">What would you like to accomplish?</h2>
+    <textarea id="g-goal" style="min-height:120px"></textarea>
+    <details style="margin-top:16px">
+      <summary class="dim" style="cursor:pointer;font-size:13px">Advanced Settings</summary>
+      <label>Build name</label><input id="adv-name" placeholder="(automatic)">
+      <label>Repo path</label><input id="adv-repo" placeholder="(Studio gets this from the server)">
+      <label>Mode</label>
+      <select id="adv-mode">
+        <option value="audit">Audit</option>
+        <option value="fix">Fix</option>
+        <option value="build">Build</option>
+        <option value="review">Review</option>
+      </select>
+      <label>Worker sequence</label>
+      <select id="adv-seq">
+        <option value="builder_only">Builder only</option>
+        <option value="builder_reviewer" selected>Builder + Reviewer</option>
+        <option value="builder_council_reviewer">Builder + Council + Reviewer</option>
+      </select>
+      <label>Safety rails</label>
+      <div id="adv-rails"></div>
+    </details>
     <div class="row"><button class="big" onclick="startNewBuild()">Start Build</button></div>
   </section>
 
@@ -158,7 +189,7 @@
 </main>
 <script>
 const $=id=>document.getElementById(id);
-let curBuild=null, agentOk=false, agentProjects=[];
+let curBuild=null, curIntent=null, curProject=null, agentOk=false, agentProjects=[];
 
 async function j(url,opts){const r=await fetch(url,opts);return r.json();}
 async function post(url,body){return j(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});}
@@ -168,7 +199,7 @@ async function copyText(text){
   catch(e){const ta=document.createElement('textarea');ta.value=text;document.body.appendChild(ta);
     ta.select();document.execCommand('copy');ta.remove();}
 }
-function show(id){['view-home','view-new','view-action'].forEach(v=>$(v).classList.toggle('hidden',v!==id));}
+function show(id){['view-home','view-pick','view-goal','view-action'].forEach(v=>$(v).classList.toggle('hidden',v!==id));}
 
 /* ── Safe Server Agent (browser-side only; studio.py never calls out) ── */
 function agentUrl(){
@@ -199,37 +230,11 @@ async function checkAgent(){
   }catch(e){agentOk=false;pill.className='agent-pill off';pill.textContent='server not connected';}
   return agentOk;
 }
-async function refreshProjects(){
-  $('server-status').textContent='checking…';
-  const ok=await checkAgent();
-  const sel=$('n-server-project');
-  sel.innerHTML='';
-  if(!ok){
-    sel.innerHTML='<option value="">(server not connected)</option>';
-    $('server-status').textContent='Server not connected — using manual project fields below.';
-    $('manual-project-area').classList.remove('hidden');
-    agentProjects=[];return;
-  }
-  try{
-    const data=await agentFetch('/projects');
-    if(data.__blocked){$('server-status').textContent='Agent blocked request: '+(data.error||'');return;}
-    agentProjects=data.projects||[];
-    sel.appendChild(new Option('Choose a server project…',''));
-    agentProjects.forEach(p=>sel.appendChild(new Option(`${p.name}${p.exists?'':' (folder missing!)'}`,p.id)));
-    sel.appendChild(new Option('— not on the server (enter manually) —','__manual__'));
-    $('server-status').textContent='Server connected.';
-    $('manual-project-area').classList.add('hidden');
-  }catch(e){$('server-status').textContent='Could not list projects: '+e;}
-}
-$('n-server-project')?.addEventListener('change',()=>{
-  $('manual-project-area').classList.toggle('hidden',$('n-server-project').value!=='__manual__');
-});
-
 /* ── home ── */
 const BADGE={'Draft':'b-draft','Copy Prompt':'b-copy','Waiting for Response':'b-wait',
   'Human Decision Needed':'b-human','Review Needed':'b-review','Complete':'b-complete','Error':'b-error'};
 async function goHome(){
-  show('view-home');curBuild=null;
+  show('view-home');curBuild=null;curIntent=null;curProject=null;
   const data=await j('/api/builds');
   const builds=data.builds||[];
   $('build-list').innerHTML=builds.length?builds.map(b=>`
@@ -237,28 +242,91 @@ async function goHome(){
       <div><div class="bn">${esc(b.buildName)}</div><div class="pn">${esc(b.projectName)} · ${esc(b.mode)}</div></div>
       <span class="badge ${BADGE[b.status]||'b-draft'}">${esc(b.status)}</span>
     </div>`).join('')
-    :'<div class="dim">No builds yet. Hit ＋ New Build.</div>';
+    :'<div class="dim">No builds yet — pick one of the buttons above.</div>';
 }
 
-/* ── new build ── */
+/* ── the flow: intent → project → one question → Start Build ──
+   Chris answers WHAT; the Server Agent already knows WHERE (paths, git,
+   branches), so the UI never asks for a folder, repo URL, or branch. */
+const INTENTS={
+  new:     {label:'Build Something New',     mode:'build',  question:'Describe what you want to build.'},
+  improve: {label:'Improve Something',       mode:'build',  question:'What would you like to accomplish?'},
+  fix:     {label:'Fix a Problem',           mode:'fix',    question:'What would you like to accomplish?'},
+  review:  {label:'Review Existing Project', mode:'review', question:'What would you like to accomplish?'},
+};
 const RAILS=["Do not deploy","Do not delete originals","Do not touch secrets",
   "Do not restart services","Do not change unrelated projects","Ask before risky actions"];
-function openNew(){
-  $('n-name').value='';$('n-goal').value='';$('n-project').value='';$('n-repo').value='';
-  $('n-mode').value='build';$('n-seq').value='builder_reviewer';
-  $('n-rails').innerHTML=RAILS.map((r,i)=>
+
+function chooseIntent(intent){
+  curIntent=intent;curProject=null;
+  if(intent==='new'){openGoal();return;}
+  $('pick-title').textContent=INTENTS[intent].label+' — which project?';
+  show('view-pick');
+  loadProjectCards();
+}
+async function loadProjectCards(){
+  $('project-cards').textContent='Looking for your projects…';
+  $('pick-fallback').classList.add('hidden');
+  const ok=await checkAgent();
+  if(!ok){
+    $('project-cards').textContent='';
+    $('pick-fallback').classList.remove('hidden');
+    agentProjects=[];return;
+  }
+  try{
+    const data=await agentFetch('/projects');
+    if(data.__blocked){
+      $('project-cards').innerHTML=`<span class="bad">Agent blocked request: ${esc(data.error||'')}</span>`;
+      return;
+    }
+    agentProjects=data.projects||[];
+    $('project-cards').innerHTML=agentProjects.length
+      ?agentProjects.map(p=>`<button class="proj-card" onclick="chooseProject('${esc(p.id)}')">
+          ${esc(p.name)}${p.exists?'':' <small>(folder missing on server)</small>'}</button>`).join('')
+      :'<span class="dim">The server has no approved projects yet — add them to agent_config.json.</span>';
+  }catch(e){
+    $('project-cards').textContent='';
+    $('pick-fallback').classList.remove('hidden');
+  }
+}
+function chooseProject(pid){
+  curProject=agentProjects.find(p=>p.id===pid)||null;
+  openGoal();
+}
+function chooseManualProject(){
+  const name=$('pick-manual-name').value.trim();
+  if(!name){alert("What's the project called?");return;}
+  curProject={id:'',name:name,path:'',checks:[]};
+  openGoal();
+}
+function openGoal(){
+  const it=INTENTS[curIntent];
+  $('g-goal').value='';$('g-name').value='';$('adv-name').value='';
+  $('goal-new-name').classList.toggle('hidden',curIntent!=='new');
+  $('goal-question').textContent=it.question;
+  $('goal-project').textContent=curProject?curProject.name:'';
+  $('adv-mode').value=it.mode;
+  $('adv-seq').value='builder_reviewer';
+  $('adv-repo').value=curProject?(curProject.path||''):'';
+  $('adv-rails').innerHTML=RAILS.map((r,i)=>
     `<label class="check"><input type="checkbox" id="rail-${i}" checked> ${esc(r)}</label>`).join('');
-  show('view-new');
-  refreshProjects();
+  show('view-goal');
+}
+function backFromGoal(){
+  if(curIntent==='new'){goHome();}else{show('view-pick');}
 }
 async function startNewBuild(){
+  const goal=$('g-goal').value.trim();
+  if(!goal){alert(INTENTS[curIntent].question);return;}
+  const projectName=curIntent==='new'?$('g-name').value.trim():(curProject?curProject.name:'');
+  if(curIntent==='new'&&!projectName){alert('Give your new project a name.');return;}
   const rails=RAILS.filter((r,i)=>$(`rail-${i}`).checked);
-  const spid=$('n-server-project').value;
-  const sp=agentProjects.find(p=>p.id===spid);
-  const body={buildName:$('n-name').value,userGoal:$('n-goal').value,
-    mode:$('n-mode').value,workerSequence:$('n-seq').value,safetyRails:rails,
-    projectName:sp?sp.name:$('n-project').value,
-    repoPath:sp?sp.path:$('n-repo').value,
+  const autoName=goal.split('\n')[0].slice(0,60)||`${INTENTS[curIntent].label}: ${projectName}`;
+  const sp=(curProject&&curProject.id)?curProject:null;
+  const body={buildName:$('adv-name').value.trim()||autoName,userGoal:goal,
+    mode:$('adv-mode').value,workerSequence:$('adv-seq').value,safetyRails:rails,
+    projectName:projectName,
+    repoPath:$('adv-repo').value.trim(),
     serverProjectId:sp?sp.id:''};
   const rec=await post('/api/builds',body);
   if(rec.error){alert(rec.error);return;}

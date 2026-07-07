@@ -2669,7 +2669,16 @@ class Handler(BaseHTTPRequestHandler):
                 room = self.rooms.get(m.group(1))
                 project = get_project(self.projects, room["project"])
                 return self._send(200, {"prompt": self.rooms.build_council_prompt(m.group(1), project)})
-            if path in ("/", "/index.html", "/guided", "/guided.html"):
+            # The front door is the Builds page — "What would you like to do
+            # today?" — per the UX rule that Chris answers WHAT and Studio
+            # figures out where/how/who. The guided flow stays at /guided.
+            if path in ("/", "/index.html", "/handoff", "/handoff.html", "/builds"):
+                try:
+                    with open(HANDOFF_PATH, "rb") as f:
+                        return self._send(200, f.read(), "text/html; charset=utf-8")
+                except OSError:
+                    return self._send(404, {"error": "handoff page missing"})
+            if path in ("/guided", "/guided.html"):
                 try:
                     with open(GUIDED_PATH, "rb") as f:
                         return self._send(200, f.read(), "text/html; charset=utf-8")
@@ -2687,12 +2696,6 @@ class Handler(BaseHTTPRequestHandler):
                         return self._send(200, f.read(), "text/html; charset=utf-8")
                 except OSError:
                     return self._send(404, {"error": "outcomes page missing"})
-            if path in ("/handoff", "/handoff.html", "/builds"):
-                try:
-                    with open(HANDOFF_PATH, "rb") as f:
-                        return self._send(200, f.read(), "text/html; charset=utf-8")
-                except OSError:
-                    return self._send(404, {"error": "handoff page missing"})
             return self._send(404, {"error": "not found"})
         except NotFound as e:
             return self._send(404, {"error": str(e)})

@@ -1433,10 +1433,14 @@ class TestGuidedBuildHTTP(_HTTPBase):
         code, err = self._req("/api/guided/veracore/chatgpt-response", {"text": "x"})
         self.assertEqual(code, 404)
 
-    def test_root_serves_guided_and_advanced_serves_dashboard(self):
+    def test_root_serves_builds_guided_moved_and_advanced_serves_dashboard(self):
+        # The front door is the intent-first Builds page; guided lives at /guided.
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/", timeout=5) as r:
             self.assertEqual(r.status, 200)
-            self.assertIn(b"<html", r.read()[:200].lower())
+            self.assertIn(b"What would you like to do today?", r.read())
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/guided", timeout=5) as r:
+            self.assertEqual(r.status, 200)
+            self.assertIn(b"guided build", r.read())
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/advanced", timeout=5) as r:
             self.assertEqual(r.status, 200)
             self.assertIn(b"<html", r.read()[:200].lower())
