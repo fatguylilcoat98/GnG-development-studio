@@ -33,7 +33,7 @@ These are enforced by `test_studio.py`'s `TestNoAutomation` class, which scans
 `Popen`, `socket.socket`, `paramiko`, `pm2`, `systemctl`, known AI/GitHub API
 hosts) rather than trusting a design intention alone.
 
-## The one exception: reading Studio's own git status
+## The first exception: reading Studio's own git status
 
 `scripts/founder-report.sh` runs plain, read-only `git status` and `git log`
 against **this repo** (the Studio's own checkout) to include in
@@ -48,6 +48,37 @@ touches git, and:
   reset, checkout, or clean.
 - It only ever operates on the Studio's own working directory — never another
   project's repo.
+
+## The second exception: build artifact verification
+
+Studio makes exactly one kind of outbound network call: a single, bounded,
+read-only GET to a build's own recorded `test_url`, and only to verify the
+folder exists, has real application files, and that URL actually responds
+(HTTP 200, not a directory listing, not connection-refused) before Chris is
+allowed to Approve or Continue past it. This exists because a Claude Code
+report claiming `STATUS: Complete` isn't proof the app was ever actually
+runnable — see the Decision Deck incident this was built to prevent.
+
+The guardrails on this one exception:
+
+- **Host allow-list, not a blanket allowance.** `_is_local_or_tailscale_host()`
+  refuses anything that isn't `localhost`, a loopback/private-LAN address, or
+  Tailscale's own CGNAT range (`100.64.0.0/10`). A real DNS name or a public
+  IP is refused outright — Studio never resolves or contacts an external
+  host, ever.
+- **Read-only, single GET, bounded read** (20KB, 5s timeout) — never a POST,
+  never follows the app's own links, never crawls.
+- **Only the build's own already-recorded URL** — never a URL Studio invents,
+  guesses, or discovers; the URL has to already be on file (from a Claude
+  Code report or Chris's own manual edit) before Studio will ever touch it.
+- **Enforced at the action layer, not just the UI** — `require_verified_or_raise()`
+  is called from the actual `continue-after-test`/`approve` handlers, so a
+  direct API call can't skip past a failed check either.
+
+`TestNoAutomation` still hard-blocks `subprocess`/`Popen`/`os.system`/
+`socket.socket`/`requests.` completely — Studio still never executes a
+command, launches a process, or calls a third-party library. Only the stdlib
+`urllib.request` GET described above is permitted, and only inside the guard.
 
 ## Hands-off projects
 

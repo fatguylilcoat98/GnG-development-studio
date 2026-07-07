@@ -16,14 +16,23 @@ advancing a project, job, note, report, decision, risk, or planning room writes
 only to the append-only JSONL/JSON state under state/ (gitignored). Prompts are
 generated TEXT for Chris to copy — never sent anywhere by this program.
 
+The one deliberate exception: build artifact verification (see
+verify_build_live below) makes a single bounded, read-only GET — but only to a
+build's own recorded test_url, and only when that URL resolves to localhost, a
+private-LAN address, or Tailscale's CGNAT range. Never an arbitrary or
+external host; never AI/GitHub/SSH. See docs/SAFETY_RAILS.md.
+
 Port: 8893 (loopback by default). Run: `python3 studio.py` (server) or
 `python3 studio.py --founder-report` (write the five reports/ files and exit).
 """
+import ipaddress
 import json
 import os
 import re
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -841,6 +850,115 @@ def build_outcome(job, project, report):
     }
 
 
+# ── build artifact verification (live) ──────────────────────────────────────────
+# The one deliberate, narrow exception to "Studio never calls out anywhere":
+# a single bounded GET to a URL Chris/Claude Code themselves already recorded,
+# and ONLY when that URL's host is localhost, a private-LAN address, or
+# Tailscale's own CGNAT range — never an arbitrary or external host, never an
+# AI/GitHub/third-party API. This is artifact verification, not internet
+# access. See docs/SAFETY_RAILS.md for the explicit policy this implements.
+_TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+_PRIVATE_RANGES = tuple(ipaddress.ip_network(r) for r in
+                       ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+
+
+def _is_local_or_tailscale_host(hostname):
+    if not hostname:
+        return False
+    if hostname.lower() == "localhost":
+        return True
+    try:
+        addr = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False   # a real DNS name, not a bare IP — refuse, no external lookups
+    return addr in _TAILSCALE_CGNAT or any(addr in r for r in _PRIVATE_RANGES)
+
+
+def verify_build_live(test_url, project_name=None, timeout=5):
+    """Verify a build's recorded test_url actually responds — the direct
+    fix for 'the report said Complete but nothing was there.' Refuses
+    anything but a localhost/private-LAN/Tailscale host."""
+    result = {"reachable": False, "http_ok": None, "is_directory_listing": None,
+             "title_matches_project": None, "problems": []}
+    if not test_url:
+        return result
+    host = urlparse(test_url).hostname
+    if not _is_local_or_tailscale_host(host):
+        result["problems"].append(
+            f"Refusing to verify {test_url} — Studio only checks localhost, "
+            "private-LAN, or Tailscale addresses, never external hosts.")
+        return result
+    try:
+        req = urllib.request.Request(test_url, headers={"User-Agent": "gng-studio-verify/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            status = r.getcode()
+            body = r.read(20000).decode("utf-8", errors="replace")
+        result["reachable"] = True
+        result["http_ok"] = (status == 200)
+        if status != 200:
+            result["problems"].append(f"{test_url} returned HTTP {status}, not 200.")
+        lower = body.lower()
+        is_listing = "directory listing for" in lower or "index of /" in lower
+        result["is_directory_listing"] = is_listing
+        if is_listing:
+            result["problems"].append(f"{test_url} returned a directory listing, not the app.")
+        if project_name:
+            result["title_matches_project"] = project_name.lower() in lower
+            # advisory only — a project name not appearing in the page isn't
+            # by itself proof of failure, so it never adds to `problems`
+    except urllib.error.URLError as e:
+        result["problems"].append(f"Could not reach {test_url}: {e.reason}")
+    except Exception as e:
+        result["problems"].append(f"Could not reach {test_url}: {e}")
+    return result
+
+
+def run_build_verification(outcome, project_name):
+    """The full artifact-verification gate: disk checks (outcome['file_check'],
+    already computed) plus a live check when a test_url is on file. ok=False
+    if either fails — this is what blocks Approve/Continue and produces the
+    Human Intervention Required screen."""
+    disk = outcome["file_check"]
+    live = verify_build_live(outcome["test_url"], project_name)
+    problems = [disk["warning"]] if disk["warning"] else []
+    problems.extend(live["problems"])
+    return {"ok": not problems, "disk": disk, "live": live, "problems": problems}
+
+
+def build_verification_fix_prompt(job, project, outcome, verification):
+    problems = "\n".join(f"- {p}" for p in verification["problems"])
+    rails = "\n".join(f"- {r}" for r in SAFETY_RAILS)
+    return f"""Use Claude Code.
+
+PROJECT: {project['name']} ({project['id']})
+REPO PATH: {project.get('repo_path') or '(not set)'}
+
+TASK: Fix the build verification failures below. Chris tried to confirm this
+build actually works, and it does not match what the last report claimed.
+
+RECORDED OUTCOME
+FOLDER: {outcome['folder'] or '(not recorded)'}
+TEST COMMAND: {outcome['test_command'] or '(not recorded)'}
+TEST URL: {outcome['test_url'] or '(not recorded)'}
+
+VERIFICATION FAILURES
+{problems}
+
+WHAT TO DO
+- Make sure the real application files actually exist in the folder above — or tell Chris the correct folder if this one is wrong.
+- Make sure the recorded test command actually starts a server that serves the app at the recorded URL.
+- Re-run the test command yourself and confirm the URL returns the real app — not a directory listing, not an error, not a blank page.
+- Report back using the standard status format, with FOLDER / TEST COMMAND / TEST URL lines that are actually correct and that you verified yourself before reporting.
+
+SAFETY RAILS (non-negotiable)
+{rails}
+
+OUTPUT REQUIREMENTS
+Reply using EXACTLY this final status format so Studio can ingest it:
+
+{FINAL_STATUS_FORMAT}"""
+
+
 # ── decisions / risks / notes ───────────────────────────────────────────────────
 class DecisionStore:
     def __init__(self, projects):
@@ -1208,7 +1326,8 @@ Do not agree blindly. Challenge assumptions."""
 # replacement plumbing system.
 GUIDED_STAGES = ("not_started", "chatgpt", "claude", "council_choice", "council",
                  "plan_review", "send_build_prompt", "claude_code_report",
-                 "test_review", "needs_approval", "complete", "stalled")
+                 "test_review", "needs_approval", "verification_failed",
+                 "complete", "stalled")
 
 
 def draft_unified_plan(room):
@@ -1283,10 +1402,22 @@ def _guided_stage_from_job(job, room, project, reports):
         latest = recs[0] if recs else None
     # Testing onward always carries the Finished Outcome data (folder, test
     # command/URL, files changed, notes) so Chris never again reaches the end
-    # of a build without a clear "here's what to open" answer.
+    # of a build without a clear "here's what to open" answer. When a test_url
+    # is on file, that's an explicit "you can open this in a browser" claim —
+    # verify it before showing the normal Continue/Approve screen at all.
     if status in ("Testing", "Needs Chris Approval"):
-        return dict(base, kind=("test_review" if status == "Testing" else "needs_approval"),
-                   latest_report=latest, outcome=build_outcome(job, project, latest))
+        kind = "test_review" if status == "Testing" else "needs_approval"
+        outcome = build_outcome(job, project, latest)
+        if outcome["test_url"]:
+            verification = run_build_verification(outcome, project["name"])
+            if not verification["ok"]:
+                return dict(base, kind="verification_failed", outcome=outcome,
+                           verification=verification,
+                           fix_prompt=build_verification_fix_prompt(job, project, outcome,
+                                                                    verification),
+                           resume_action=("continue-after-test" if status == "Testing"
+                                         else "approve"))
+        return dict(base, kind=kind, latest_report=latest, outcome=outcome)
     if status == "Approved":
         return dict(base, kind="complete", needs_final_click=True, archived=False,
                    outcome=build_outcome(job, project, latest))
@@ -1351,11 +1482,28 @@ def guided_claude_code_report(jobs, reports, job_id, project_id, raw):
     return job, rec
 
 
-def guided_continue_after_test(jobs, job_id):
+def require_verified_or_raise(reports, projects, job):
+    """The actual enforcement behind 'block approval' — checked here in
+    addition to the stage display, so a direct API call can't skip past a
+    failed Human Intervention Required screen. Only gates jobs that have a
+    test_url on file; jobs with nothing to verify are unaffected."""
+    project = get_project(projects, job["project"])
+    recs = reports.list(job_id=job["id"])
+    latest = recs[0] if recs else None
+    outcome = build_outcome(job, project, latest)
+    if outcome["test_url"]:
+        verification = run_build_verification(outcome, project["name"])
+        if not verification["ok"]:
+            raise IllegalTransition(
+                "Build verification failed: " + "; ".join(verification["problems"]))
+
+
+def guided_continue_after_test(jobs, reports, projects, job_id):
     job = jobs.get(job_id)
     nxt = JobStore.allowed_next(job)
     if not nxt:
         raise IllegalTransition(f"job {job_id} has no legal next step from {job['status']}")
+    require_verified_or_raise(reports, projects, job)
     return jobs.advance(job_id, nxt[0])   # single legal option at Testing — no branching to pick
 
 
@@ -2404,7 +2552,7 @@ class Handler(BaseHTTPRequestHandler):
                 stage = compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports)
                 if not stage.get("job_id"):
                     return self._send(409, {"error": "no job is at Testing"})
-                guided_continue_after_test(self.jobs, stage["job_id"])
+                guided_continue_after_test(self.jobs, self.reports, self.projects, stage["job_id"])
                 self._sync(pid)
                 return self._send(200, compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports))
             m = re.match(rf"^/api/guided/({_PID_RE})/approve$", path)
@@ -2413,6 +2561,8 @@ class Handler(BaseHTTPRequestHandler):
                 stage = compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports)
                 if not stage.get("job_id"):
                     return self._send(409, {"error": "no job is waiting on approval"})
+                job = self.jobs.get(stage["job_id"])
+                require_verified_or_raise(self.reports, self.projects, job)
                 self.jobs.advance(stage["job_id"], "Approved")
                 self._sync(pid)
                 return self._send(200, compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports))

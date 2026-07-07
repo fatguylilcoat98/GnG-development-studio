@@ -2,6 +2,9 @@
 a temp state directory — the real state/ (if any) is never touched. Studio is
 coordination-only: no AI/GitHub/SSH calls, no deployment, no service management —
 enforced here by a source scan, not just by convention."""
+import contextlib
+import functools
+import http.server
 import json
 import os
 import shutil
@@ -472,13 +475,22 @@ class TestNeedsChris(Base):
 
 class TestNoAutomation(Base):
     """Coordination-only, test-enforced: no AI/GitHub/SSH/deploy/service-mgmt
-    surface anywhere in the core module or the dashboard."""
+    surface anywhere in the core module or the dashboard. One narrow,
+    explicitly-approved exception exists — build artifact verification may GET
+    a build's own recorded test_url, but ONLY when it resolves to localhost, a
+    private-LAN address, or Tailscale's CGNAT range — see docs/SAFETY_RAILS.md."""
 
-    def test_no_subprocess_socket_network_in_studio_module(self):
+    def test_no_subprocess_socket_or_arbitrary_network_in_studio_module(self):
         src = open(os.path.join(ROOT, "studio.py")).read()
         for forbidden in ("import subprocess", "os.system", "Popen", "socket.socket",
-                          "urllib.request", "requests."):
+                          "requests."):
             self.assertNotIn(forbidden, src, f"studio.py contains {forbidden}")
+        # urllib.request IS present, but only for the approved verification
+        # exception, and only guarded by the local/Tailscale host check —
+        # both guards must still exist in source.
+        self.assertIn("urllib.request", src)
+        self.assertIn("100.64.0.0/10", src)   # Tailscale CGNAT range guard
+        self.assertIn("_is_local_or_tailscale_host", src)
 
     def test_no_ai_or_github_api_endpoints_anywhere(self):
         src = open(os.path.join(ROOT, "studio.py")).read()
@@ -1229,7 +1241,7 @@ class TestGuidedBuildNoCouncil(Base):
         stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms)
         self.assertEqual(stage["kind"], "test_review")
 
-        s.guided_continue_after_test(self.jobs, stage["job_id"])
+        s.guided_continue_after_test(self.jobs, self.reports, self.projects, stage["job_id"])
         stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms)
         # GOOD_REPORT sets NEEDS APPROVAL: no -> Testing goes straight to Completed
         self.assertEqual(stage["kind"], "complete")
@@ -1322,7 +1334,7 @@ class TestGuidedBuildApprovalGate(Base):
         report = ("STATUS: Blocked\nFILES CHANGED: x\nTESTS: 2/5\nCOMMIT: none\nPR: none\n"
                  "BLOCKERS: needs a decision\nNEXT ACTION: fix\nNEEDS APPROVAL: yes")
         s.guided_claude_code_report(self.jobs, self.reports, job["id"], pid, report)
-        s.guided_continue_after_test(self.jobs, job["id"])
+        s.guided_continue_after_test(self.jobs, self.reports, self.projects, job["id"])
         stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms)
         self.assertEqual(stage["kind"], "needs_approval")
 
@@ -1332,7 +1344,7 @@ class TestGuidedBuildApprovalGate(Base):
 
         s.guided_claude_code_report(self.jobs, self.reports, job["id"], pid,
                                     TestClaudeReportIngestion.GOOD_REPORT)
-        s.guided_continue_after_test(self.jobs, job["id"])
+        s.guided_continue_after_test(self.jobs, self.reports, self.projects, job["id"])
         stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms)
         self.assertEqual(stage["kind"], "complete")   # GOOD_REPORT needs_approval: no
 
@@ -1557,6 +1569,158 @@ class TestBuildOutcomeFileCheck(Base):
         self.assertIsNone(outcome["file_check"]["warning"])
 
 
+@contextlib.contextmanager
+def _local_static_server(folder):
+    """A real, local, ephemeral-port static file server for exercising
+    verify_build_live against actual HTTP responses (200s, directory
+    listings) instead of mocking urllib."""
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=folder)
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), handler)
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield f"http://127.0.0.1:{port}/"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+class TestLocalTailscaleHostGuard(unittest.TestCase):
+    def test_allows_localhost_loopback_private_and_tailscale(self):
+        for host in ("localhost", "127.0.0.1", "10.1.2.3", "192.168.1.5",
+                    "172.16.0.1", "100.90.72.114"):
+            self.assertTrue(s._is_local_or_tailscale_host(host), host)
+
+    def test_refuses_public_ip_and_dns_names_and_empty(self):
+        for host in ("8.8.8.8", "example.com", "api.github.com", "", None):
+            self.assertFalse(s._is_local_or_tailscale_host(host), host)
+
+
+class TestVerifyBuildLive(unittest.TestCase):
+    def test_no_url_is_a_no_op(self):
+        result = s.verify_build_live("")
+        self.assertEqual(result["problems"], [])
+        self.assertFalse(result["reachable"])
+
+    def test_refuses_external_host_without_making_a_request(self):
+        result = s.verify_build_live("https://example.com/")
+        self.assertFalse(result["reachable"])
+        self.assertIn("Refusing to verify", result["problems"][0])
+
+    def test_unreachable_local_port_reports_a_clear_problem(self):
+        result = s.verify_build_live("http://127.0.0.1:1/", timeout=2)
+        self.assertFalse(result["reachable"])
+        self.assertTrue(any("Could not reach" in p for p in result["problems"]))
+
+    def test_real_app_returns_ok_with_no_problems(self):
+        folder = tempfile.mkdtemp()
+        try:
+            with open(os.path.join(folder, "index.html"), "w") as f:
+                f.write("<html><title>Decision Deck</title><body>Decision Deck</body></html>")
+            with _local_static_server(folder) as url:
+                result = s.verify_build_live(url, project_name="Decision Deck")
+                self.assertEqual(result["problems"], [])
+                self.assertTrue(result["reachable"])
+                self.assertTrue(result["http_ok"])
+                self.assertFalse(result["is_directory_listing"])
+                self.assertTrue(result["title_matches_project"])
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_directory_listing_is_detected_as_a_problem(self):
+        folder = tempfile.mkdtemp()   # no index.html -> http.server serves a listing
+        try:
+            with _local_static_server(folder) as url:
+                result = s.verify_build_live(url)
+                self.assertTrue(result["is_directory_listing"])
+                self.assertTrue(any("directory listing" in p for p in result["problems"]))
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+
+class TestRunBuildVerification(Base):
+    def test_ok_when_folder_and_url_both_check_out(self):
+        folder = tempfile.mkdtemp(dir=self.tmp)
+        with open(os.path.join(folder, "index.html"), "w") as f:
+            f.write("<html><title>Veracore</title></html>")
+        with _local_static_server(folder) as url:
+            job = self.make_job(project="veracore")
+            raw = (TestClaudeReportIngestion.GOOD_REPORT.replace(
+                      "FILES CHANGED: studio.py, dashboard.html", "FILES CHANGED: index.html")
+                  + f"\nFOLDER: {folder}\nTEST URL: {url}")
+            rec = self.reports.ingest(job["id"], "veracore", raw)
+            outcome = s.build_outcome(job, self.projects["veracore"], rec)
+            verification = s.run_build_verification(outcome, "Veracore")
+            self.assertTrue(verification["ok"], verification["problems"])
+
+    def test_not_ok_when_url_is_unreachable(self):
+        job = self.make_job(project="veracore")
+        raw = TestClaudeReportIngestion.GOOD_REPORT + "\nTEST URL: http://127.0.0.1:1/"
+        rec = self.reports.ingest(job["id"], "veracore", raw)
+        outcome = s.build_outcome(job, self.projects["veracore"], rec)
+        verification = s.run_build_verification(outcome, "Veracore")
+        self.assertFalse(verification["ok"])
+        self.assertTrue(verification["problems"])
+
+
+class TestVerificationBlocksGuidedFlow(Base):
+    """The actual 'block approval' + 'Human Intervention Required' behavior:
+    when a build's recorded test_url doesn't check out, the guided flow must
+    not silently advance, at either the stage-display layer or the action
+    layer (a direct API call can't skip past it either)."""
+
+    def _job_at_testing_with_bad_url(self):
+        pid = "veracore"
+        room = s.start_guided_build(pid, self.jobs, self.rooms, "Decision Deck test")
+        self.rooms.paste_chatgpt_response(room["id"], "x")
+        self.rooms.paste_claude_response(room["id"], "y")
+        stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports)
+        job, room, _ = s.guided_approve_plan(self.projects, self.rooms, self.notes, pid,
+                                             room["id"], stage["plan_draft"])
+        s.guided_sent_to_claude_code(self.jobs, job["id"])
+        raw = (TestClaudeReportIngestion.GOOD_REPORT +
+              f"\nFOLDER: {os.path.join(s.PROJECTS_DIR, 'veracore')}"
+              "\nTEST COMMAND: npm run dev\nTEST URL: http://127.0.0.1:1/")
+        s.guided_claude_code_report(self.jobs, self.reports, job["id"], pid, raw)
+        return pid, job["id"]
+
+    def test_stage_shows_verification_failed_instead_of_test_review(self):
+        pid, job_id = self._job_at_testing_with_bad_url()
+        stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports)
+        self.assertEqual(stage["kind"], "verification_failed")
+        # port 1 on loopback is a valid local host, so this fails at connect
+        # time ("Could not reach"), not the external-host refusal path.
+        self.assertTrue(any("Could not reach" in p for p in stage["verification"]["problems"]))
+        self.assertIn("Use Claude Code.", stage["fix_prompt"])
+        self.assertEqual(stage["resume_action"], "continue-after-test")
+
+    def test_guided_continue_after_test_raises_when_verification_fails(self):
+        pid, job_id = self._job_at_testing_with_bad_url()
+        with self.assertRaises(s.IllegalTransition):
+            s.guided_continue_after_test(self.jobs, self.reports, self.projects, job_id)
+        # job must still be at Testing -- nothing advanced
+        self.assertEqual(self.jobs.get(job_id)["status"], "Testing")
+
+    def test_fixing_the_url_unblocks_the_same_job(self):
+        pid, job_id = self._job_at_testing_with_bad_url()
+        folder = tempfile.mkdtemp(dir=self.tmp)
+        with open(os.path.join(folder, "index.html"), "w") as f:
+            f.write("<html>ok</html>")
+        # GOOD_REPORT's FILES CHANGED ("studio.py, dashboard.html") is still
+        # on the report -- amend() only overrides folder/test_command/
+        # test_url/blockers -- so satisfy the disk file-existence check too.
+        open(os.path.join(folder, "studio.py"), "w").close()
+        open(os.path.join(folder, "dashboard.html"), "w").close()
+        with _local_static_server(folder) as url:
+            self.reports.amend(self.reports.list(job_id=job_id)[0]["id"],
+                              folder=folder, test_url=url)
+            stage = s.compute_guided_stage(pid, self.projects, self.jobs, self.rooms, self.reports)
+            self.assertEqual(stage["kind"], "test_review")
+            s.guided_continue_after_test(self.jobs, self.reports, self.projects, job_id)
+            self.assertEqual(self.jobs.get(job_id)["status"], "Completed")
+
+
 class TestListOutcomes(Base):
     def test_no_finished_jobs_yields_empty_list(self):
         self.make_job(project="veracore")   # stays Draft — not finished
@@ -1573,7 +1737,7 @@ class TestListOutcomes(Base):
         s.guided_sent_to_claude_code(self.jobs, job["id"])
         s.guided_claude_code_report(self.jobs, self.reports, job["id"], pid,
                                     TestClaudeReportIngestion.GOOD_REPORT)
-        s.guided_continue_after_test(self.jobs, job["id"])   # GOOD_REPORT: needs_approval no -> Completed
+        s.guided_continue_after_test(self.jobs, self.reports, self.projects, job["id"])   # GOOD_REPORT: needs_approval no -> Completed
         outcomes = s.list_outcomes(self.projects, self.jobs, self.reports)
         self.assertEqual(len(outcomes), 1)
         self.assertEqual(outcomes[0]["project"], "veracore")

@@ -381,6 +381,26 @@ async function renderStage(stage){
       </div>`;
     return;
   }
+  if(stage.kind==='verification_failed'){
+    const problems=(stage.verification.problems||[]).map(p=>`<li>${esc(p)}</li>`).join('');
+    const canSendBack=stage.resume_action==='approve';
+    body.innerHTML=`
+      <h2 class="bad">Build Verification Failed</h2>
+      ${outcomeCard(stage.outcome)}
+      <div class="file-warning">
+        <div class="what">⚠ Human Intervention Required</div>
+        <p class="lead" style="margin:6px 0 0">This build did not verify. Here's exactly what failed:</p>
+        <ul style="margin:6px 0 0 18px;padding:0">${problems}</ul>
+      </div>
+      <h3 style="margin-top:16px">Fix prompt for Claude Code</h3>
+      <pre class="copyblock" id="fix-prompt">${esc(stage.fix_prompt)}</pre>
+      ${copyButton('fix-prompt')}
+      <div class="row">
+        <button class="big" onclick="refreshStage()">I fixed it — Verify Again</button>
+        ${canSendBack?'<button class="ghost" onclick="rejectBuild()">Send Back for More Work</button>':''}
+      </div>`;
+    return;
+  }
   if(stage.kind==='complete'){
     const label=stage.archived?'Archived.':(stage.needs_final_click?'Approved — one more step.':'Completed.');
     body.innerHTML=`

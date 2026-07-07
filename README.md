@@ -46,7 +46,11 @@ Claude-Code resume prompt — see [`docs/WORKFLOW.md`](docs/WORKFLOW.md).
 - Not live. `GNG_STUDIO_MODE` is always `dry-run` — there is no live mode.
 
 Everything here is coordination: prompts to copy, reports to paste, status to
-track. See [`docs/SAFETY_RAILS.md`](docs/SAFETY_RAILS.md) and
+track. The one deliberate exception is **build artifact verification** — before
+Chris can Approve or Continue past a build, Studio makes a single read-only GET
+to that build's own recorded URL, but only when it's localhost, private-LAN, or
+Tailscale — never an external host. See
+[`docs/SAFETY_RAILS.md`](docs/SAFETY_RAILS.md) for the full guardrails, and
 [`docs/ROADMAP.md`](docs/ROADMAP.md) for what's deliberately deferred.
 
 ## Run
