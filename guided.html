@@ -267,6 +267,26 @@ async function refreshStage(){
   renderStage(stage);
 }
 
+async function verifyAgain(btn){
+  // The re-check often returns the exact same "still failing" result, which
+  // re-renders to identical HTML — with no visible feedback that looks
+  // indistinguishable from the button not working at all. Force a visible
+  // state change around the click so a click is never silent.
+  const original=btn.textContent;
+  btn.disabled=true;
+  btn.textContent='Verifying…';
+  try{
+    await refreshStage();
+  }catch(e){
+    alert('Verification check failed to run: '+e);
+  }finally{
+    if(document.body.contains(btn)){
+      btn.disabled=false;
+      btn.textContent=original;
+    }
+  }
+}
+
 function interventionShell(what, needed, actionHtml){
   return `<div class="intervention">
     <h2>Human Intervention Required</h2>
@@ -391,12 +411,13 @@ async function renderStage(stage){
         <div class="what">⚠ Human Intervention Required</div>
         <p class="lead" style="margin:6px 0 0">This build did not verify. Here's exactly what failed:</p>
         <ul style="margin:6px 0 0 18px;padding:0">${problems}</ul>
+        <p class="dim" style="margin:10px 0 0;font-size:12.5px">Last checked: ${new Date().toLocaleTimeString()}</p>
       </div>
       <h3 style="margin-top:16px">Fix prompt for Claude Code</h3>
       <pre class="copyblock" id="fix-prompt">${esc(stage.fix_prompt)}</pre>
       ${copyButton('fix-prompt')}
       <div class="row">
-        <button class="big" onclick="refreshStage()">I fixed it — Verify Again</button>
+        <button class="big" onclick="verifyAgain(this)">I fixed it — Verify Again</button>
         ${canSendBack?'<button class="ghost" onclick="rejectBuild()">Send Back for More Work</button>':''}
       </div>`;
     return;
